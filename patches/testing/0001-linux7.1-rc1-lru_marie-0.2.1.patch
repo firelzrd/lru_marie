@@ -1,7 +1,7 @@
-From 0a262b196699c7f5277560d76c91b9d1aa84649c Mon Sep 17 00:00:00 2001
+From 5ca37e8a64881faf6dbb86cc52305debce8c1a60 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Mon, 25 May 2026 11:03:49 +0900
-Subject: [PATCH] linux7.1-rc1-lru_marie-0.2.0
+Date: Mon, 25 May 2026 16:25:41 +0900
+Subject: [PATCH] linux7.1-rc1-lru_marie-0.2.1
 
 ---
  include/linux/lru_marie.h      |  441 ++++++
@@ -11,7 +11,7 @@ Subject: [PATCH] linux7.1-rc1-lru_marie-0.2.0
  mm/Kconfig                     |   30 +
  mm/Makefile                    |    1 +
  mm/huge_memory.c               |   26 +-
- mm/internal.h                  |   60 +
+ mm/internal.h                  |   70 +
  mm/lru_marie/Makefile          |   19 +
  mm/lru_marie/bitmap.c          |  166 +++
  mm/lru_marie/bitmap.h          |  228 +++
@@ -23,20 +23,20 @@ Subject: [PATCH] linux7.1-rc1-lru_marie-0.2.0
  mm/lru_marie/simd_x86_avx2.S   |  214 +++
  mm/lru_marie/simd_x86_avx512.S |  199 +++
  mm/lru_marie/simd_x86_sse2.S   |  215 +++
- mm/lru_marie/state.c           | 2472 ++++++++++++++++++++++++++++++++
+ mm/lru_marie/state.c           | 2500 ++++++++++++++++++++++++++++++++
  mm/lru_marie/state.h           | 1295 +++++++++++++++++
  mm/lru_marie/version.h         |   22 +
  mm/lru_marie/walker.c          | 1002 +++++++++++++
  mm/memcontrol-v1.c             |   13 +
  mm/memcontrol.c                |   34 +
  mm/mm_init.c                   |    3 +
- mm/page_alloc.c                |   84 ++
+ mm/page_alloc.c                |   92 ++
  mm/page_io.c                   |  187 +++
  mm/rmap.c                      |    6 +
  mm/swap.c                      |  102 ++
  mm/swap.h                      |    4 +
- mm/vmscan.c                    |  296 +++-
- 32 files changed, 9517 insertions(+), 7 deletions(-)
+ mm/vmscan.c                    |  311 +++-
+ 32 files changed, 9578 insertions(+), 7 deletions(-)
  create mode 100644 include/linux/lru_marie.h
  create mode 100644 mm/lru_marie/Makefile
  create mode 100644 mm/lru_marie/bitmap.c
@@ -814,10 +814,10 @@ index 970e077019..9b6315ceef 100644
  	}
  }
 diff --git a/mm/internal.h b/mm/internal.h
-index 5a2ddcf68e..6d93d6b61f 100644
+index 5a2ddcf68e..c0a83ebc6f 100644
 --- a/mm/internal.h
 +++ b/mm/internal.h
-@@ -625,12 +625,60 @@ extern unsigned long highest_memmap_pfn;
+@@ -625,12 +625,70 @@ extern unsigned long highest_memmap_pfn;
   */
  #define MAX_RECLAIM_RETRIES 16
  
@@ -840,6 +840,14 @@ index 5a2ddcf68e..6d93d6b61f 100644
 + * ~1% of total RAM in marie_init().
 + */
 +extern unsigned long marie_oom_min_free_kbytes;
++
++/*
++ * Marie's clean-file floor as a percentage of total RAM. Owned by
++ * mm/lru_marie/core.c. Read by should_reclaim_retry's early-OOM gate
++ * so OOM is withheld while reclaimable file cache stays at/above the
++ * same floor the Marie pick driver protects.
++ */
++extern unsigned int marie_clean_min_ratio;
 +#endif
 +
  /*
@@ -861,6 +869,8 @@ index 5a2ddcf68e..6d93d6b61f 100644
 +		struct mem_cgroup *memcg);
  extern void reclaim_throttle(pg_data_t *pgdat, enum vmscan_throttle_state reason);
 +int vmscan_reclaimer_offset(struct scan_control *sc);
++bool vmscan_can_reclaim_anon_pages(struct mem_cgroup *memcg, int nid,
++				   struct scan_control *sc);
 +
 +/*
 + * scan_control accessors -- read/update the few fields out-of-tree
@@ -878,7 +888,7 @@ index 5a2ddcf68e..6d93d6b61f 100644
  int user_proactive_reclaim(char *buf,
  			   struct mem_cgroup *memcg, pg_data_t *pgdat);
  
-@@ -693,6 +741,18 @@ struct alloc_context {
+@@ -693,6 +751,18 @@ struct alloc_context {
  	 */
  	enum zone_type highest_zoneidx;
  	bool spread_dirty_pages;
@@ -4292,10 +4302,10 @@ index 0000000000..4646ca1b9c
 +SYM_FUNC_END(lru_marie_simd_scan_sse2)
 diff --git a/mm/lru_marie/state.c b/mm/lru_marie/state.c
 new file mode 100644
-index 0000000000..2bcac9f761
+index 0000000000..53e6d98fd7
 --- /dev/null
 +++ b/mm/lru_marie/state.c
-@@ -0,0 +1,2472 @@
+@@ -0,0 +1,2500 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Marie per-PFN state array — allocation, init, and global counters.
@@ -5500,9 +5510,29 @@ index 0000000000..2bcac9f761
 +	int type_count;
 +	int idx;
 +	bool skip_file = false;
++	/*
++	 * When anon cannot be reclaimed at all (no free swap slots,
++	 * cgroup swap limit hit, no demotion target), swappiness is by
++	 * definition meaningless -- it expresses the anon:file reclaim
++	 * ratio, and one side of that ratio no longer exists. Every ANON
++	 * pick would reclaim nothing, and because the bias controller
++	 * takes no back-pressure from a zero-reclaim pick
++	 * (marie_swap_bias_update bails on !nr_reclaimed), the bias never
++	 * flips to FILE: reclaimable file cache is stranded until OOM.
++	 * Drop the stubborn swappiness preference and force FILE only,
++	 * mirroring get_scan_count()'s "!can_reclaim_anon_pages ->
++	 * SCAN_FILE". The clean_min_ratio floor below still applies, so
++	 * file is reclaimed only down to the protected floor; past it the
++	 * caller's early-OOM gate (should_reclaim_retry) fires.
++	 */
++	bool anon_unreclaimable =
++		!vmscan_can_reclaim_anon_pages(memcg, pgdat->node_id, sc);
 +	int type;
 +
-+	pick_kind = marie_swap_pick_type(mlv_bias, swappiness);
++	if (anon_unreclaimable)
++		pick_kind = MARIE_PICK_FILE_STRICT;
++	else
++		pick_kind = marie_swap_pick_type(mlv_bias, swappiness);
 +	switch (pick_kind) {
 +	case MARIE_PICK_FILE_STRICT:
 +		type_order[0] = 1;
@@ -5930,7 +5960,15 @@ index 0000000000..2bcac9f761
 +			 * jumps PAST this tail intentionally: we are winning,
 +			 * the controller does not need a back-pressure tick.
 +			 */
-+			if (attempted_pick && !skip_file)
++			/*
++			 * anon_unreclaimable forced FILE_STRICT above,
++			 * bypassing the proportional controller; do not let
++			 * those forced-file picks drive the bias (matches the
++			 * "special swappiness values bypass the controller"
++			 * rule -- the bias must resume cleanly once swap
++			 * capacity returns and can_reclaim_anon flips back).
++			 */
++			if (attempted_pick && !skip_file && !anon_unreclaimable)
 +				marie_swap_bias_update(mlv_bias, type,
 +						       n_reclaimed, swappiness);
 +			if (pick_kind == MARIE_PICK_FILE_THEN_ANON &&
@@ -8071,7 +8109,7 @@ index 0000000000..1f2cbdcf03
 +#endif /* _MM_LRU_MARIE_STATE_H */
 diff --git a/mm/lru_marie/version.h b/mm/lru_marie/version.h
 new file mode 100644
-index 0000000000..2e108424ca
+index 0000000000..03b83475b9
 --- /dev/null
 +++ b/mm/lru_marie/version.h
 @@ -0,0 +1,22 @@
@@ -8094,7 +8132,7 @@ index 0000000000..2e108424ca
 +#define MARIE_PROGNAME	"Marie LRU"
 +#define MARIE_AUTHOR	"Masahito Suzuki"
 +
-+#define MARIE_VERSION	"0.2.0"
++#define MARIE_VERSION	"0.2.1"
 +
 +#endif /* _MM_LRU_MARIE_VERSION_H */
 diff --git a/mm/lru_marie/walker.c b/mm/lru_marie/walker.c
@@ -9217,7 +9255,7 @@ index f9f8e1af92..5855f9ef89 100644
  
  	for (i = 0; i < NR_VMSCAN_THROTTLE; i++)
 diff --git a/mm/page_alloc.c b/mm/page_alloc.c
-index 65e2051115..1745cc89df 100644
+index 65e2051115..70a60fa758 100644
 --- a/mm/page_alloc.c
 +++ b/mm/page_alloc.c
 @@ -16,6 +16,7 @@
@@ -9257,7 +9295,7 @@ index 65e2051115..1745cc89df 100644
  	if (memcg_kmem_online() && PageMemcgKmem(page))
  		__memcg_kmem_uncharge_page(page, order);
  
-@@ -4595,6 +4618,53 @@ should_reclaim_retry(gfp_t gfp_mask, unsigned order,
+@@ -4595,6 +4618,61 @@ should_reclaim_retry(gfp_t gfp_mask, unsigned order,
  	if (*no_progress_loops > MAX_RECLAIM_RETRIES)
  		goto out;
  
@@ -9290,8 +9328,16 @@ index 65e2051115..1745cc89df 100644
 +		 */
 +		total_free_kb = (global_zone_page_state(NR_FREE_PAGES) +
 +				 get_nr_swap_pages()) << (PAGE_SHIFT - 10);
-+		if (total_free_kb < floor_kb)
-+			goto out;
++		if (total_free_kb < floor_kb) {
++			unsigned int min_ratio = READ_ONCE(marie_clean_min_ratio);
++			unsigned long file_pages =
++				global_node_page_state(NR_ACTIVE_FILE) +
++				global_node_page_state(NR_INACTIVE_FILE);
++			unsigned long file_min = totalram_pages() * min_ratio / 100;
++
++			if (min_ratio == 0 || file_pages < file_min)
++				goto out;
++		}
 +
 +		/*
 +		 * (2) Swap backend has rejected writes during this allocation.
@@ -9311,7 +9357,7 @@ index 65e2051115..1745cc89df 100644
  
  	/*
  	 * Keep reclaiming pages while there is a chance this will lead
-@@ -4718,6 +4788,20 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+@@ -4718,6 +4796,20 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
  		WARN_ON_ONCE(current->flags & PF_MEMALLOC);
  	}
  
@@ -9780,7 +9826,7 @@ index a77016f242..7f499ac84c 100644
  /* linux/mm/swap_state.c */
  extern struct address_space swap_space __read_mostly;
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index bd1b1aa125..219fa4bc3b 100644
+index bd1b1aa125..4f39460464 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
 @@ -39,6 +39,7 @@
@@ -9872,7 +9918,7 @@ index bd1b1aa125..219fa4bc3b 100644
  	}
  	return size;
  }
-@@ -458,6 +511,30 @@ static int reclaimer_offset(struct scan_control *sc)
+@@ -458,6 +511,45 @@ static int reclaimer_offset(struct scan_control *sc)
  	return PGSTEAL_DIRECT - PGSTEAL_KSWAPD;
  }
  
@@ -9898,12 +9944,27 @@ index bd1b1aa125..219fa4bc3b 100644
 +{
 +	return cgroup_reclaim((struct scan_control *)sc);
 +}
++
++/*
++ * can_reclaim_anon_pages() is static above. Marie's pick driver needs
++ * the same predicate: when anon cannot be reclaimed at all (no free
++ * swap slots, cgroup swap limit hit, no demotion target) the
++ * swappiness/bias controller is meaningless -- every ANON pick
++ * reclaims nothing -- so Marie must force FILE reclaim, mirroring
++ * get_scan_count()'s "!can_reclaim_anon_pages -> SCAN_FILE" forcing.
++ * Expose it as a vmscan_* wrapper; struct scan_control stays private.
++ */
++bool vmscan_can_reclaim_anon_pages(struct mem_cgroup *memcg, int nid,
++				   struct scan_control *sc)
++{
++	return can_reclaim_anon_pages(memcg, nid, sc);
++}
 +#endif
 +
  /*
   * We detected a synchronous write error writing a folio out.  Probably
   * -ENOSPC.  We need to propagate that into the address_space for a subsequent
-@@ -885,7 +962,11 @@ static enum folio_references folio_check_references(struct folio *folio,
+@@ -885,7 +977,11 @@ static enum folio_references folio_check_references(struct folio *folio,
  	if (referenced_ptes == -1)
  		return FOLIOREF_KEEP;
  
@@ -9915,7 +9976,7 @@ index bd1b1aa125..219fa4bc3b 100644
  		if (!referenced_ptes)
  			return FOLIOREF_RECLAIM;
  
-@@ -894,6 +975,30 @@ static enum folio_references folio_check_references(struct folio *folio,
+@@ -894,6 +990,30 @@ static enum folio_references folio_check_references(struct folio *folio,
  
  	referenced_folio = folio_test_clear_referenced(folio);
  
@@ -9946,7 +10007,7 @@ index bd1b1aa125..219fa4bc3b 100644
  	if (referenced_ptes) {
  		/*
  		 * All mapped folios start out with page table
-@@ -1053,9 +1158,13 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
+@@ -1053,9 +1173,13 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
  }
  
  /*
@@ -9962,7 +10023,7 @@ index bd1b1aa125..219fa4bc3b 100644
  		struct pglist_data *pgdat, struct scan_control *sc,
  		struct reclaim_stat *stat, bool ignore_references,
  		struct mem_cgroup *memcg)
-@@ -5307,6 +5416,55 @@ static bool drain_evictable(struct lruvec *lruvec)
+@@ -5307,6 +5431,55 @@ static bool drain_evictable(struct lruvec *lruvec)
  	return true;
  }
  
@@ -10018,7 +10079,7 @@ index bd1b1aa125..219fa4bc3b 100644
  static void lru_gen_change_state(bool enabled)
  {
  	static DEFINE_MUTEX(state_mutex);
-@@ -5928,6 +6086,18 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+@@ -5928,6 +6101,18 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
  	bool proportional_reclaim;
  	struct blk_plug plug;
  
@@ -10037,7 +10098,7 @@ index bd1b1aa125..219fa4bc3b 100644
  	if ((lru_gen_enabled() || lru_gen_switching()) && !root_reclaim(sc)) {
  		lru_gen_shrink_lruvec(lruvec, sc);
  
-@@ -6193,14 +6363,32 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+@@ -6193,14 +6378,32 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
  	struct lruvec *target_lruvec;
  	bool reclaimable = false;
  
@@ -10071,7 +10132,7 @@ index bd1b1aa125..219fa4bc3b 100644
  
  	target_lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup, pgdat);
  
-@@ -6469,6 +6657,17 @@ static void snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat)
+@@ -6469,6 +6672,17 @@ static void snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat)
  	struct lruvec *target_lruvec;
  	unsigned long refaults;
  
@@ -10089,7 +10150,7 @@ index bd1b1aa125..219fa4bc3b 100644
  	if (lru_gen_enabled() && !lru_gen_switching())
  		return;
  
-@@ -6859,6 +7058,21 @@ static void kswapd_age_node(struct pglist_data *pgdat, struct scan_control *sc)
+@@ -6859,6 +7073,21 @@ static void kswapd_age_node(struct pglist_data *pgdat, struct scan_control *sc)
  	struct mem_cgroup *memcg;
  	struct lruvec *lruvec;
  
@@ -10111,7 +10172,7 @@ index bd1b1aa125..219fa4bc3b 100644
  	if (lru_gen_enabled() || lru_gen_switching()) {
  		lru_gen_age_node(pgdat, sc);
  
-@@ -7632,6 +7846,9 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
+@@ -7632,6 +7861,9 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
  void __meminit kswapd_run(int nid)
  {
  	pg_data_t *pgdat = NODE_DATA(nid);
@@ -10121,7 +10182,7 @@ index bd1b1aa125..219fa4bc3b 100644
  
  	pgdat_kswapd_lock(pgdat);
  	if (!pgdat->kswapd) {
-@@ -7645,7 +7862,32 @@ void __meminit kswapd_run(int nid)
+@@ -7645,7 +7877,32 @@ void __meminit kswapd_run(int nid)
  		} else {
  			wake_up_process(pgdat->kswapd);
  		}
@@ -10154,7 +10215,7 @@ index bd1b1aa125..219fa4bc3b 100644
  	pgdat_kswapd_unlock(pgdat);
  }
  
-@@ -7664,16 +7906,60 @@ void __meminit kswapd_stop(int nid)
+@@ -7664,16 +7921,60 @@ void __meminit kswapd_stop(int nid)
  		kthread_stop(kswapd);
  		pgdat->kswapd = NULL;
  	}
