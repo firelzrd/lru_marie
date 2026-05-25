@@ -240,8 +240,6 @@ cat /sys/kernel/mm/lru_marie/version       # e.g., 0.2.0
 | x86-64 (AVX2 / SSE2)      | ✅ working        | auto-selected when AVX-512F absent                                                                                   |
 | ARM64                     | ⚠️ scalar only    | NEON walker pending FPU save/restore profiling vs. the scalar baseline                                               |
 | Other arches              | ⚠️ scalar only    | functional, no SIMD acceleration                                                                                     |
-| THP (large folios)        | ⚠️ partial        | large folios use a synchronous per-type-locked install path; full transparent integration is planned                               |
-| Page-level memcg reparent | ❌ not wired      | Marie state for dying memcgs is freed via `lru_marie_exit_memcg()` at css_free; no page-level migration to parent     |
 
 Known kernel bases with Marie 0.2.0 patches in this repo: 6.12.74, 6.18.22, 7.0, 7.1-rc1.  All four ports share the same Marie source tree (`mm/lru_marie*.c/.h`, `include/linux/lru_marie*.h`) — the patches differ only in base-kernel-side adaptations.  In particular, the batched no-flush young-PTE API used by Marie's walker is native on 7.1-rc1 (`test_and_clear_young_ptes` / `test_and_clear_young_ptes_notify`), absent on 7.0 (the 7.0 patch back-ports it into `include/linux/pgtable.h` and `include/linux/mmu_notifier.h`), and absent on 6.18 and 6.12 (the 6.18 and 6.12 patches back-port the same API plus thin `lazy_mmu_mode_enable/disable` wrappers, since they only have `arch_enter_lazy_mmu_mode` and lack the 7.0 reentrancy-tracking helpers).
 
