@@ -27,7 +27,7 @@ Legend — ✅ behaves as expected · ⚠️ works but with a structural trade-o
 | Hot-signal harvest    | ⚠️ rmap-driven `PG_referenced` only; no active walker                      | ✅ PTE walker + walker-internal PMD bloom filter + rmap look-around cascading `PG_referenced`                | ✅ Vectorized PTE walker + rmap-fed PMD bloom filter + rmap look-around updating a saturating tier bit only            |
 | Compression stall     | ❌ kswapd blocks inside `zswap_store`                                      | ❌ kswapd blocks inside `zswap_store`                                                                        | ✅ offloaded to per-node `kcompmari` kthread                                                                 |
 | Clean-file floor      | ❌ none                                                                    | ❌ none                                                                                                      | ✅ `clean_min_ratio` hard floor against thrashing                                                            |
-| Reclaim-livelock OOM  | ❌ retries until `MAX_RECLAIM_RETRIES`                                     | ❌ retries until `MAX_RECLAIM_RETRIES`                                                                       | ✅ early-OOM via `oom_min_free_kbytes` + swap-write-failure gate                                             |
+| Reclaim-livelock OOM  | ❌ retries until `MAX_RECLAIM_RETRIES`                                     | ❌ retries until `MAX_RECLAIM_RETRIES`                                                                       | ✅ `clean_min_ratio` floor enforced on every reclaim path → reclaim stops cleanly at the floor and the stock no-progress OOM fires promptly; plus a swap-write-failure fast-path |
 
 These are deliberate choices on MGLRU's side: fewer state bits per folio, fewer fast-path branches, a single iteration counter shared between memory types, a self-contained walker that owns its own feedback.  Marie's complementary design accepts the resulting state cost in exchange for proportional `vm.swappiness` control under a generational ring, hard working-set protection, and a hot-signal pipeline that pulls the rmap into the loop instead of letting it cascade `PG_referenced` onto neighbouring folios.
 
@@ -38,8 +38,8 @@ These are deliberate choices on MGLRU's side: fewer state bits per folio, fewer 
 ```
               le9uo           Re-swappiness        kcompressd-unofficial
                 │                   │                       │
-        clean_min_ratio,        per-type            kcompressd kthread +
-        oom_min_free_kbytes     seq / min_seq       FIFO write-back
+        clean_min_ratio         per-type            kcompressd kthread +
+        (hard file floor)       seq / min_seq       FIFO write-back
                 │                   │                       │
                 └─────────┬─────────┴───────────────────────┘
                           │
@@ -55,7 +55,7 @@ These are deliberate choices on MGLRU's side: fewer state bits per folio, fewer 
 
 Marie keeps the **goals** of its predecessors but doesn't reuse their implementations verbatim — it re-derives each idea inside its own LRU core so the surrounding state (gen ring, lock topology, scan order) is internally consistent.
 
-- From **le9uo**: hard working-set protection (`clean_min_ratio`) and early-OOM watermark (`oom_min_free_kbytes`).  `anon_min_ratio` and `clean_low_ratio` from le9uo are intentionally **not** ported — under Marie the former is largely redundant with `vm.swappiness` once `kcompmari` brings anon refault sub-millisecond, and the latter overlaps with the existing `swap_tokens` bucket.
+- From **le9uo**: hard working-set protection (`clean_min_ratio`).  Like le9uo, Marie enforces the floor on the single path that actually reclaims and then lets the kernel's stock no-progress OOM path fire — once clean file is at the floor and anon is unreclaimable, reclaim returns no progress and the OOM killer fires promptly, with no separate early-OOM watermark needed (this is why le9uo converges at any floor size).  `anon_min_ratio` and `clean_low_ratio` from le9uo are intentionally **not** ported — under Marie the former is largely redundant with `vm.swappiness` once `kcompmari` brings anon refault sub-millisecond, and the latter overlaps with the existing `swap_tokens` bucket.
 - From **Re-swappiness**: per-type `seq` / `min_seq` so `vm.swappiness` acts as a proportional anon:file scan ratio under a generational ring (the property Legacy LRU already has and MGLRU loses by sharing `max_seq`).  Re-swappiness ports this onto MGLRU's structure; Marie owns its own per-type state inside `marie_lruvec` and does not depend on MGLRU being per-type.
 - From **kcompressd-unofficial**: per-node async compression FIFO so kswapd doesn't block in `zswap_store` / `__swap_writepage`.  Marie carries this over as `kcompmari` (renamed from `kcompressd` for Marie's namespace) with the same per-node FIFO design and the same 0–256 depth knob, default 24.
 
@@ -143,8 +143,12 @@ Marie keeps **fully independent** per-type state — each of ANON and FILE has i
 
 ### Pressure resilience
 
-- **`clean_min_ratio` (hard working-set floor).**  At reclaim time Marie diverts file → anon selection when clean file pages would otherwise be evicted below the configured percentage of node RAM. Equivalent in spirit to le9uo's knob of the same name.  Default 10%; set to 0 to disable.
-- **`oom_min_free_kbytes` (early-OOM).**  Inside `should_reclaim_retry()`, Marie aborts the retry loop and lets the OOM killer fire as soon as either: (a) free RAM + free swap drops below the threshold, or (b) the swap backend has rejected more than `MAX_SWAP_WRITE_FAIL_RETRIES` writes during this allocation attempt (e.g. ZRAM `zs_malloc` starvation). Defaults to ~1% of total RAM, clamped to [4 MiB, 512 MiB], or whatever's set via `/sys/kernel/mm/lru_marie/oom_min_free_kbytes`.
+- **`clean_min_ratio` (hard working-set floor).**  Marie withholds file reclaim — on *every* reclaim path (the per-PFN pick driver and the legacy drain that follows it in `shrink_lruvec`) — when clean file pages would otherwise be evicted below the configured percentage of node RAM, diverting reclaim to anon instead. Only clean file counts toward the floor: dirty pages, which cannot be reclaimed without writeback, are subtracted so they cannot satisfy the floor on unreclaimable pages. Equivalent in spirit to le9uo's knob of the same name.  Default 10%; set to 0 to disable.
+
+  The pick driver selects the reclaim type via a strict priority cascade: OOM victims and anon-unreclaimable conditions force FILE-only (no point swapping if no slots exist or the reaper is taking the anon anyway); `vm.swappiness=0` forces FILE-only regardless of the floor (the hard no-swap contract — at the floor file is also blocked, so this OOMs rather than swaps, which is the intended behaviour); the floor-in-force condition forces ANON-only, outranking the proportional controller so a FILE-biased pick cannot get pinned on the floor-blocked side and stall reclaim at high `vm.swappiness` values. Otherwise the swap-bias proportional pick applies.
+
+  The legacy orphan drain in `shrink_lruvec()` that follows the picker (draining folios that landed on `lruvec->lists` due to failed Marie installs or drain handoffs) mirrors the pick result via a `MARIE_DRAIN_*` bitmask returned by `lru_marie_shrink_lruvec()`. The drain zeroes `nr[]` for any type the picker did not scan, preventing `get_scan_count()`'s `SCAN_EQUAL` path (triggered at `sc->priority == 0`) from evicting file behind the picker's back during swap-fill at high `vm.swappiness`.
+- **No-progress OOM + swap-write-failure fast-path.**  Because the floor is enforced on every reclaim path, once clean file is at the floor and anon is unreclaimable reclaim returns no progress — so the kernel's stock `no_progress_loops` path in `should_reclaim_retry()` reaches the OOM killer promptly, with no separate free-memory watermark needed (this is exactly how le9uo converges at any floor size).  One Marie-specific addition remains in that slowpath: it also aborts the retry loop as soon as the swap backend has rejected more than `MAX_SWAP_WRITE_FAIL_RETRIES` writes during this allocation attempt — e.g. ZRAM `zs_malloc` starvation, where `can_reclaim_anon_pages()` still reports free slots that no longer accept writes, a case the floor alone would only resolve after grinding file down to it.
 - **`kcompmari` async swap-out.**  Per-node kernel thread that drains a `kfifo` of anon folios deposited by kswapd, running `zswap_store` / `__swap_writepage` off the reclaim critical path. The depth knob takes signed values from `-100` to `+100` (default `+24`). `0` disables the offload, positive values queue up to `|v|` folios and are gated by Marie's enabled state, and negative values force-enable the thread even when Marie is turned off.
 
 ### Coexistence
@@ -167,7 +171,6 @@ All knobs live under `/sys/kernel/mm/lru_marie/` and accept runtime writes (exce
 | `clean_min_ratio`             | `10`          | 0–100, %RAM                 | Hard floor on clean file pages.  Below this, reclaim diverts to anon instead of evicting file.               |
 | `kcompmari`                   | `24`          | -100..+100                  | Async swap queue depth. `0` disables. Positive = Marie-gated; negative = force-enable regardless of Marie. |
 | `gen_growth_threshold`        | `8192`        | folios (`SWAP_CLUSTER_MAX << 8`) | Head-generation growth limit before a new gen is cut.                                                   |
-| `oom_min_free_kbytes`         | ~1% of RAM    | KiB, clamped 4–512 MiB      | Free-RAM + free-swap floor below which `should_reclaim_retry()` gives up and the OOM killer fires.  `0` disables. |
 | `walker_interval_critical_ms` | `HZ/30` (~33 ms) | ms                       | Walker cadence under critical memory pressure.                                                               |
 | `walker_interval_low_ms`      | `HZ/10` (100 ms) | ms                        | Walker cadence under low pressure.                                                                           |
 | `walker_interval_normal_ms`   | `HZ/4` (250 ms) | ms                         | Walker cadence under normal pressure.                                                                        |
@@ -197,26 +200,17 @@ This guarantees that swap-out is strictly reserved for times of *genuine* memory
 
 ### Disable `systemd-oomd`
 
-It is highly recommended to **disable or mask `systemd-oomd`**. Marie LRU's internal memory management is extremely robust under heavy pressure. Furthermore, Marie implements its own `oom_min_free_kbytes` early-OOM trigger, which operates deep inside the allocator slowpath (`should_reclaim_retry()`) and catches livelocks instantly. User-space OOM daemons like `systemd-oomd` often misinterpret Marie's proactive cache management as memory exhaustion and prematurely kill user applications.
+It is highly recommended to **disable or mask `systemd-oomd`**. Marie LRU's internal memory management is extremely robust under heavy pressure. The `clean_min_ratio` floor (enforced on every reclaim path) lets reclaim reach a clean no-progress state at the floor, so the kernel's own OOM killer fires promptly without thrashing, and a swap-write-failure fast-path deep inside the allocator slowpath (`should_reclaim_retry()`) catches ZRAM stalls instantly. User-space OOM daemons like `systemd-oomd` often misinterpret Marie's proactive cache management as memory exhaustion and prematurely kill user applications.
 
 ---
 
 ## Build & install
 
-The `patches/` directory contains tested patches against tagged kernel bases:
-
-```
-patches/testing/0001-linux6.12.74-lru_marie-0.2.0.patch
-patches/testing/0001-linux6.18.22-lru_marie-0.2.0.patch
-patches/testing/0001-linux7.0-lru_marie-0.2.0.patch
-patches/testing/0001-linux7.1-rc1-lru_marie-0.2.0.patch
-```
-
 To apply against a matching source tree:
 
 ```
 cd /path/to/linux
-patch -p1 < /path/to/lru_marie/patches/testing/0001-linux<base>-lru_marie-0.2.0.patch
+patch -p1 < lru_marie.patch
 make olddefconfig    # answer Y to CONFIG_LRU_MARIE
 make -j$(nproc)
 ```

@@ -1,42 +1,42 @@
-From 0567251d99da8bee562cab015feedf5c1c2442ec Mon Sep 17 00:00:00 2001
+From e7bf3e4a2df8125ff68d3badb163de74e5d571ba Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Mon, 25 May 2026 16:25:41 +0900
-Subject: [PATCH] linux7.0-lru_marie-0.2.1
+Date: Tue, 26 May 2026 12:33:31 +0900
+Subject: [PATCH] linux7.0-lru_marie-0.2.2
 
 ---
- include/linux/lru_marie.h      |  441 ++++++
+ include/linux/lru_marie.h      |  453 ++++++
  include/linux/mm_inline.h      |   67 +
- include/linux/mmzone.h         |   35 +
+ include/linux/mmzone.h         |   31 +
  include/linux/swap.h           |   18 +
  mm/Kconfig                     |   30 +
  mm/Makefile                    |    1 +
  mm/huge_memory.c               |   26 +-
- mm/internal.h                  |   70 +
+ mm/internal.h                  |   55 +
  mm/lru_marie/Makefile          |   19 +
- mm/lru_marie/bitmap.c          |  166 +++
+ mm/lru_marie/bitmap.c          |  166 ++
  mm/lru_marie/bitmap.h          |  228 +++
- mm/lru_marie/core.c            | 1882 ++++++++++++++++++++++++
+ mm/lru_marie/core.c            | 1815 ++++++++++++++++++++++
  mm/lru_marie/prefetch.h        |   92 ++
  mm/lru_marie/simd.h            |   99 ++
  mm/lru_marie/simd_generic.c    |   46 +
- mm/lru_marie/simd_x86.c        |  167 +++
+ mm/lru_marie/simd_x86.c        |  167 ++
  mm/lru_marie/simd_x86_avx2.S   |  214 +++
  mm/lru_marie/simd_x86_avx512.S |  199 +++
  mm/lru_marie/simd_x86_sse2.S   |  215 +++
- mm/lru_marie/state.c           | 2500 ++++++++++++++++++++++++++++++++
- mm/lru_marie/state.h           | 1295 +++++++++++++++++
+ mm/lru_marie/state.c           | 2594 ++++++++++++++++++++++++++++++++
+ mm/lru_marie/state.h           | 1293 ++++++++++++++++
  mm/lru_marie/version.h         |   22 +
- mm/lru_marie/walker.c          | 1018 +++++++++++++
+ mm/lru_marie/walker.c          |  960 ++++++++++++
  mm/memcontrol-v1.c             |   13 +
  mm/memcontrol.c                |   13 +
  mm/mm_init.c                   |    3 +
- mm/page_alloc.c                |   92 ++
+ mm/page_alloc.c                |   76 +
  mm/page_io.c                   |  187 +++
  mm/rmap.c                      |    6 +
  mm/swap.c                      |  102 ++
  mm/swap.h                      |    4 +
- mm/vmscan.c                    |  307 +++-
- 32 files changed, 9571 insertions(+), 6 deletions(-)
+ mm/vmscan.c                    |  334 +++-
+ 32 files changed, 9542 insertions(+), 6 deletions(-)
  create mode 100644 include/linux/lru_marie.h
  create mode 100644 mm/lru_marie/Makefile
  create mode 100644 mm/lru_marie/bitmap.c
@@ -56,10 +56,10 @@ Subject: [PATCH] linux7.0-lru_marie-0.2.1
 
 diff --git a/include/linux/lru_marie.h b/include/linux/lru_marie.h
 new file mode 100644
-index 0000000000..3913fc90d5
+index 0000000000..4539f50474
 --- /dev/null
 +++ b/include/linux/lru_marie.h
-@@ -0,0 +1,441 @@
+@@ -0,0 +1,453 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _LINUX_LRU_MARIE_H
 +#define _LINUX_LRU_MARIE_H
@@ -241,14 +241,26 @@ index 0000000000..3913fc90d5
 + */
 +void lru_marie_free_page_hook(unsigned long pfn);
 +
++/*
++ * Return value of lru_marie_shrink_lruvec(): a mask of the LRU type(s) the
++ * Marie pick driver actually scanned this call. shrink_lruvec's legacy orphan
++ * drain reclaims ONLY these types (it zeroes the nr[] of any unset type), so
++ * it never cuts a type Marie's swappiness / clean_min_ratio / ANON_STRICT
++ * policy protected -- unlike stock get_scan_count, which the legacy drain
++ * would otherwise follow blindly (SCAN_EQUAL at priority 0, etc.).
++ */
++#define MARIE_DRAIN_ANON	0x1u
++#define MARIE_DRAIN_FILE	0x2u
++
 +/**
 + * lru_marie_shrink_lruvec - Marie's replacement for shrink_lruvec().
 + *
 + * Called from mm/vmscan.c shrink_lruvec() when lru_marie_enabled() is true.
-+ * Updates sc->nr_reclaimed in place; returns no value (matching the
-+ * existing shrink_lruvec contract).
++ * Updates sc->nr_reclaimed in place. Returns a MARIE_DRAIN_* mask of the
++ * type(s) it scanned so the caller's legacy orphan drain can mirror the pick
++ * policy instead of running stock get_scan_count's.
 + */
-+void lru_marie_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc);
++unsigned int lru_marie_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc);
 +
 +/**
 + * lru_marie_exit_memcg - drop any per-lruvec Marie state held for @memcg.
@@ -392,12 +404,12 @@ index 0000000000..3913fc90d5
 + * across transitions into or out of the special-value range
 + * {0, 1, MAX_SWAPPINESS}.
 + *
-+ * Walks marie_lruvec_xa unconditionally (no per-memcg filtering): the
-+ * extra resets on unaffected lruvecs are harmless under a controller
-+ * whose only state is the bias counter, and the alternative -- per
-+ * memcg / per cgroup-version classification -- adds cost without
-+ * changing observable behaviour. Sysctl writes are human-rate and
-+ * the walk is O(N_lruvecs * one atomic64_set).
++ * Walks every lruvec via mem_cgroup_iter unconditionally (no per-memcg
++ * filtering): the extra resets on unaffected lruvecs are harmless under
++ * a controller whose only state is the bias counter, and the
++ * alternative -- per memcg / per cgroup-version classification -- adds
++ * cost without changing observable behaviour. Sysctl writes are
++ * human-rate and the walk is O(N_lruvecs * one atomic64_set).
 + *
 + * Safe to call from sysctl proc_handler context (BKL-free, may sleep
 + * on xa_lock contention but never under the writer's caller locks).
@@ -627,7 +639,7 @@ index fa2d6ba811..174a59aa5a 100644
  		return;
  
 diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
-index 3e51190a55..125524cd92 100644
+index 3e51190a55..e82e2a0c2f 100644
 --- a/include/linux/mmzone.h
 +++ b/include/linux/mmzone.h
 @@ -23,6 +23,8 @@
@@ -639,33 +651,29 @@ index 3e51190a55..125524cd92 100644
  #include <asm/page.h>
  
  /* Free memory management - zoned buddy allocator.  */
-@@ -695,6 +697,25 @@ struct lruvec {
+@@ -695,6 +697,21 @@ struct lruvec {
  	struct pglist_data *pgdat;
  #endif
  	struct zswap_lruvec_state zswap_lruvec_state;
 +#ifdef CONFIG_LRU_MARIE
 +	/*
-+	 * Cached pointer to this lruvec's struct marie_lruvec — the
-+	 * canonical mapping is the marie_lruvec_xa xarray keyed by
-+	 * lv pointer, but every fault-path dispatcher (lru_marie_add_folio,
-+	 * lru_marie_del_folio, etc.) needed an xa_load on the hot path.
-+	 * xas_load showed up at ~2% in cycles profiles even after the D3
-+	 * refactor; caching the result on the lruvec itself collapses the
-+	 * lookup to a single READ_ONCE.
++	 * Pointer to this lruvec's struct marie_lruvec — the single source
++	 * of truth (no side xarray). Lazily allocated on first use by
++	 * marie_get_lruvec() via cmpxchg, and cleared then freed by
++	 * marie_drop_lruvec() under lv->lru_lock when the lruvec's memcg is
++	 * torn down. Fault-path dispatchers (lru_marie_add_folio,
++	 * lru_marie_del_folio, etc.) read it with a single READ_ONCE.
 +	 *
 +	 * void * because struct marie_lruvec is internal to
-+	 * mm/lru_marie/state.h. The pointer is published by
-+	 * marie_get_lruvec() after xa_cmpxchg succeeds and cleared by
-+	 * marie_drop_lruvec() under lv->lru_lock before xa_erase, so the
-+	 * same lock that protected xa_load callers from racing with the
-+	 * teardown now also protects the cached pointer's lifetime.
++	 * mm/lru_marie/state.h. Its lifetime is tied to the lruvec/memcg, so
++	 * any caller holding a valid lruvec observes a live mlv without RCU.
 +	 */
 +	void				*marie_mlv;
 +#endif
  };
  
  /* Isolate for asynchronous migration */
-@@ -1438,6 +1459,20 @@ typedef struct pglist_data {
+@@ -1438,6 +1455,20 @@ typedef struct pglist_data {
  
  	atomic_t kswapd_failures;	/* Number of 'reclaimed == 0' runs */
  
@@ -815,10 +823,10 @@ index b298cba853..ce3216f6e1 100644
  	}
  }
 diff --git a/mm/internal.h b/mm/internal.h
-index cb0af847d7..2717a0f342 100644
+index cb0af847d7..e543d4fbb5 100644
 --- a/mm/internal.h
 +++ b/mm/internal.h
-@@ -609,12 +609,70 @@ extern unsigned long highest_memmap_pfn;
+@@ -609,12 +609,55 @@ extern unsigned long highest_memmap_pfn;
   */
  #define MAX_RECLAIM_RETRIES 16
  
@@ -834,21 +842,6 @@ index cb0af847d7..2717a0f342 100644
 + */
 +#define MAX_SWAP_WRITE_FAIL_RETRIES 16
 +
-+/*
-+ * Marie's early-OOM watermark (KiB). Owned by mm/lru_marie/core.c,
-+ * consumed by mm/page_alloc.c:should_reclaim_retry. Tunable at runtime
-+ * via /sys/kernel/mm/lru_marie/oom_min_free_kbytes; auto-defaulted to
-+ * ~1% of total RAM in marie_init().
-+ */
-+extern unsigned long marie_oom_min_free_kbytes;
-+
-+/*
-+ * Marie's clean-file floor as a percentage of total RAM. Owned by
-+ * mm/lru_marie/core.c. Read by should_reclaim_retry's early-OOM gate
-+ * so OOM is withheld while reclaimable file cache stays at/above the
-+ * same floor the Marie pick driver protects.
-+ */
-+extern unsigned int marie_clean_min_ratio;
 +#endif
 +
  /*
@@ -889,7 +882,7 @@ index cb0af847d7..2717a0f342 100644
  int user_proactive_reclaim(char *buf,
  			   struct mem_cgroup *memcg, pg_data_t *pgdat);
  
-@@ -672,6 +730,18 @@ struct alloc_context {
+@@ -672,6 +715,18 @@ struct alloc_context {
  	 */
  	enum zone_type highest_zoneidx;
  	bool spread_dirty_pages;
@@ -1341,10 +1334,10 @@ index 0000000000..1439771849
 +#endif	/* _MM_LRU_MARIE_BITMAP_H */
 diff --git a/mm/lru_marie/core.c b/mm/lru_marie/core.c
 new file mode 100644
-index 0000000000..bf62467812
+index 0000000000..71c8dd4d63
 --- /dev/null
 +++ b/mm/lru_marie/core.c
-@@ -0,0 +1,1882 @@
+@@ -0,0 +1,1815 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * mm/lru_marie/core.c — Marie LRU.
@@ -1376,11 +1369,11 @@ index 0000000000..bf62467812
 + *   struct marie_lruvec  — Marie's per-lruvec state (anon + file types,
 + *                          per-(lru, zone) page count, swap_bias)
 + *
-+ *   marie_lruvec_xa      — side-channel xarray:
-+ *                          key  = (unsigned long)lruvec pointer
-+ *                          val  = struct marie_lruvec *
++ *   lv->marie_mlv        — per-lruvec pointer to struct marie_lruvec,
++ *                          the single source of truth (no side xarray;
++ *                          lifetime tied to the lruvec/memcg, no RCU)
 + *
-+ *   marie_get_lruvec()   — lazy lookup/allocation
++ *   marie_get_lruvec()   — lazy lookup/allocation (cmpxchg publish)
 + *   marie_drop_lruvec()  — remove and free one entry
 + *   lru_marie_exit_memcg()   — drop all entries belonging to a dying memcg
 + *
@@ -1436,8 +1429,8 @@ index 0000000000..bf62467812
 + *     "anon only" override. Both are intentional user policy
 + *     overrides; clean_min_ratio does not punch through them.
 + *   - systemd-oomd OFF
-+ *     systemd-oomd reacts to PSI before Marie's own
-+ *     oom_min_free_kbytes watermark has a chance to stabilise
++ *     systemd-oomd reacts to PSI before Marie's clean_min_ratio
++ *     floor + no-progress OOM path has a chance to stabilise
 + *     reclaim. With Marie engaged the kernel-side OOM gate is more
 + *     accurate, and userspace OOMD ends up killing tasks Marie
 + *     would have rescued. Disable it (or leave its swap thresholds
@@ -1532,12 +1525,10 @@ index 0000000000..bf62467812
 + */
 +
 +/*
-+ * Side-channel mapping: lruvec pointer → struct marie_lruvec.
-+ *
-+ * XA_FLAGS_LOCK_IRQ so xa_load/xa_store are safe from atomic contexts
-+ * (folio_add_lru can run with irqs disabled).
++ * Per-lruvec Marie state is reached directly through lv->marie_mlv (the
++ * single source of truth; no side xarray, no RCU). marie_nr_lruvecs
++ * counts live mlvs for stats only.
 + */
-+DEFINE_XARRAY_FLAGS(marie_lruvec_xa, XA_FLAGS_LOCK_IRQ);
 +static atomic_long_t marie_nr_lruvecs;
 +
 +/*
@@ -1576,37 +1567,29 @@ index 0000000000..bf62467812
 +	if (likely(mlv))
 +		return mlv;
 +
-+	mlv = xa_load(&marie_lruvec_xa, (unsigned long)lv);
-+	if (mlv) {
-+		/* Cache filled by another CPU's xa_cmpxchg path but not yet
-+		 * mirrored here (or our cache was cleared mid-teardown and
-+		 * raced an xa lookup). Either way, mirror it now. */
-+		WRITE_ONCE(lv->marie_mlv, mlv);
-+		return mlv;
-+	}
-+
-+	/* Use GFP_ATOMIC to be safe from any context.  The first hit
-+	 * for any given lruvec pays this cost; subsequent xa_loads are
-+	 * cheap. */
++	/* Use GFP_ATOMIC to be safe from any context.  The first hit for
++	 * any given lruvec pays this cost; subsequent reads hit the cached
++	 * pointer above. */
 +	gfp = (in_task() && !irqs_disabled()) ? GFP_KERNEL : GFP_ATOMIC;
 +	mlv = marie_alloc_lruvec(lv, gfp);
 +	if (!mlv)
 +		return NULL;
 +
-+	old = xa_cmpxchg(&marie_lruvec_xa, (unsigned long)lv, NULL, mlv, gfp);
-+	if (xa_is_err(old)) {
-+		marie_free_lruvec(mlv);
-+		return NULL;
-+	}
++	/*
++	 * Publish authoritatively into lv->marie_mlv -- the single source
++	 * of truth for this lruvec's Marie state (no side xarray). cmpxchg
++	 * resolves the lazy-alloc race: the loser frees its allocation and
++	 * adopts the winner's. The pointer lives until the lruvec's memcg is
++	 * freed (marie_drop_lruvec from mem_cgroup_free), so any caller
++	 * holding a valid lruvec sees a live mlv without RCU.
++	 */
++	old = cmpxchg((struct marie_lruvec **)&lv->marie_mlv, NULL, mlv);
 +	if (old) {
-+		/* lost the race; another CPU allocated first */
 +		marie_free_lruvec(mlv);
-+		WRITE_ONCE(lv->marie_mlv, old);
 +		return old;
 +	}
 +
 +	atomic_long_inc(&marie_nr_lruvecs);
-+	WRITE_ONCE(lv->marie_mlv, mlv);
 +	return mlv;
 +}
 +
@@ -1641,40 +1624,38 @@ index 0000000000..bf62467812
 +	 * path.
 +	 */
 +	/*
-+	 * migrate_disable across drain so the synchronize_rcu below
-+	 * still has a well-defined CPU context if PREEMPT_RT is in
-+	 * effect. The drain itself only touches per-lv state, so no
-+	 * per-CPU producer/consumer queue is in play.
++	 * The drain touches only per-lv state and runs under
++	 * spin_lock_irq(&lv->lru_lock), which already disables preemption
++	 * and IRQs (the former migrate_disable() only existed to give the
++	 * now-removed synchronize_rcu() a stable CPU context).
 +	 */
-+	migrate_disable();
 +	spin_lock_irq(&lv->lru_lock);
 +	marie_drain_one_lruvec(lv);
 +	/*
-+	 * Invalidate the cached lv->marie_mlv before xa_erase so that any
-+	 * dispatcher fast-path that observes the cleared cache will fall
-+	 * through to xa_load and get NULL (since xa_erase is published
-+	 * within this same lock section). Cache reads outside lru_lock
-+	 * remain safe because marie_drain_one_lruvec above clears
-+	 * MARIE_TRACKED on every still-tracked folio, so by the time we
-+	 * release lru_lock no folio carries the bit that would route a
-+	 * concurrent del back into @mlv.
++	 * Capture and clear the authoritative lv->marie_mlv under lru_lock.
++	 * A concurrent dispatcher (lru_marie_add_folio / lru_marie_del_folio)
++	 * holds the same lru_lock, and marie_drain_one_lruvec above cleared
++	 * MARIE_TRACKED on every still-tracked folio, so once this lock is
++	 * dropped no path can route a del back into @mlv.
 +	 */
++	mlv = READ_ONCE(lv->marie_mlv);
 +	WRITE_ONCE(lv->marie_mlv, NULL);
-+	mlv = xa_erase(&marie_lruvec_xa, (unsigned long)lv);
 +	spin_unlock_irq(&lv->lru_lock);
-+	migrate_enable();
 +
 +	if (!mlv)
 +		return;
 +	atomic_long_dec(&marie_nr_lruvecs);
 +
 +	/*
-+	 * Wait for any walker (xa_for_each under rcu_read_lock) that may
-+	 * have observed @mlv before the xa_erase. The walker does not
-+	 * take lru_lock so the spinlock dance above does not cover it.
++	 * No synchronize_rcu() needed. With the side xarray gone there is no
++	 * ref-free RCU reader of @mlv: swappiness_changed enumerates via
++	 * mem_cgroup_iter (ref-pinned), the walker's pass-end housekeeping no
++	 * longer walks per-mlv, and its per-PTE lookups deref @mlv only for
++	 * folios charged to a live memcg. Every other accessor is serialised
++	 * by lv->lru_lock above. drop_lruvec runs at mem_cgroup_free
++	 * (refcount 0, no charges) or runtime disable, so @mlv is unreachable
++	 * by the time it is freed.
 +	 */
-+	synchronize_rcu();
-+
 +	marie_free_lruvec(mlv);
 +}
 +
@@ -1921,15 +1902,13 @@ index 0000000000..bf62467812
 +		return false;
 +
 +	/*
-+	 * Direct xa_load (rather than marie_get_lruvec) so we work
-+	 * even when the gate is off mid-transition.  Race against
++	 * Direct lv->marie_mlv read (rather than marie_get_lruvec) so we
++	 * work even when the gate is off mid-transition. Race against
 +	 * marie_drop_lruvec is closed by lru_lock serialisation:
-+	 * marie_drop_lruvec's xa_erase runs under the same lv->lru_lock
++	 * marie_drop_lruvec clears lv->marie_mlv under the same lv->lru_lock
 +	 * that our caller (lruvec_del_folio) holds.
 +	 */
 +	mlv = READ_ONCE(lv->marie_mlv);
-+	if (!mlv)
-+		mlv = xa_load(&marie_lruvec_xa, (unsigned long)lv);
 +	if (!mlv) {
 +		/*
 +		 * @lv has no mlv but @folio still carries MARIE_TRACKED.
@@ -2011,8 +1990,6 @@ index 0000000000..bf62467812
 +
 +	child_mlv = READ_ONCE(child_lv->marie_mlv);
 +	if (!child_mlv)
-+		child_mlv = xa_load(&marie_lruvec_xa, (unsigned long)child_lv);
-+	if (!child_mlv)
 +		return;
 +
 +	/*
@@ -2059,8 +2036,6 @@ index 0000000000..bf62467812
 +		return 0;
 +	mlv = READ_ONCE(lv->marie_mlv);
 +	if (!mlv)
-+		mlv = xa_load(&marie_lruvec_xa, (unsigned long)lv);
-+	if (!mlv)
 +		return 0;
 +	/*
 +	 * Hot heuristic read (lruvec_lru_size sums Marie + legacy for the
@@ -2091,18 +2066,36 @@ index 0000000000..bf62467812
 + */
 +void lru_marie_swappiness_changed(void)
 +{
-+	struct marie_lruvec *mlv;
-+	unsigned long index;
++	struct mem_cgroup *memcg;
 +
 +	if (!lru_marie_enabled())
 +		return;
 +
-+	rcu_read_lock();
-+	xa_for_each(&marie_lruvec_xa, index, mlv) {
-+		if (mlv)
-+			atomic64_set(&mlv->swap_bias, 0);
-+	}
-+	rcu_read_unlock();
++	/*
++	 * Reset every lruvec's swap_bias to neutral. Enumerate via
++	 * mem_cgroup_iter (which ref-pins each memcg across the step,
++	 * keeping its mlv alive) rather than a ref-free xarray walk -- a
++	 * human-rate sysctl path, so the per-memcg ref is irrelevant.
++	 *
++	 * Also covers the !memcg / mem_cgroup_disabled node lruvec:
++	 * mem_cgroup_iter then yields NULL, the body runs once with
++	 * memcg==NULL, and mem_cgroup_lruvec(NULL, pgdat) resolves to
++	 * pgdat->__lruvec. Best-effort -- a missed lruvec simply keeps its
++	 * bias and reconverges under the controller.
++	 */
++	memcg = mem_cgroup_iter(NULL, NULL, NULL);
++	do {
++		int nid;
++
++		for_each_node_state(nid, N_MEMORY) {
++			struct lruvec *lv =
++				mem_cgroup_lruvec(memcg, NODE_DATA(nid));
++			struct marie_lruvec *mlv = READ_ONCE(lv->marie_mlv);
++
++			if (mlv)
++				atomic64_set(&mlv->swap_bias, 0);
++		}
++	} while ((memcg = mem_cgroup_iter(NULL, memcg, NULL)));
 +}
 +EXPORT_SYMBOL_GPL(lru_marie_swappiness_changed);
 +
@@ -2136,11 +2129,8 @@ index 0000000000..bf62467812
 + * mid-flip). Same lv->marie_mlv cache as the gated path. */
 +static struct marie_lruvec *marie_lookup_lruvec(struct lruvec *lv)
 +{
-+	struct marie_lruvec *mlv = READ_ONCE(lv->marie_mlv);
-+
-+	if (likely(mlv))
-+		return mlv;
-+	return xa_load(&marie_lruvec_xa, (unsigned long)lv);
++	/* lv->marie_mlv is authoritative; NULL means no Marie state. */
++	return READ_ONCE(lv->marie_mlv);
 +}
 +
 +/* As marie_get_lruvec() but bypasses the lru_marie_enabled() gate. */
@@ -2152,28 +2142,17 @@ index 0000000000..bf62467812
 +	mlv = READ_ONCE(lv->marie_mlv);
 +	if (mlv)
 +		return mlv;
-+	mlv = xa_load(&marie_lruvec_xa, (unsigned long)lv);
-+	if (mlv) {
-+		WRITE_ONCE(lv->marie_mlv, mlv);
-+		return mlv;
-+	}
 +
 +	mlv = marie_alloc_lruvec(lv, gfp);
 +	if (!mlv)
 +		return NULL;
 +
-+	old = xa_cmpxchg(&marie_lruvec_xa, (unsigned long)lv, NULL, mlv, gfp);
-+	if (xa_is_err(old)) {
-+		marie_free_lruvec(mlv);
-+		return NULL;
-+	}
++	old = cmpxchg((struct marie_lruvec **)&lv->marie_mlv, NULL, mlv);
 +	if (old) {
 +		marie_free_lruvec(mlv);
-+		WRITE_ONCE(lv->marie_mlv, old);
 +		return old;
 +	}
 +	atomic_long_inc(&marie_nr_lruvecs);
-+	WRITE_ONCE(lv->marie_mlv, mlv);
 +	return mlv;
 +}
 +
@@ -2268,17 +2247,32 @@ index 0000000000..bf62467812
 +		folio_clear_active(folio);
 +	lru = folio_lru_list(folio);
 +
-+	if (lru != LRU_UNEVICTABLE)
-+		list_move(&folio->lru, &lruvec->lists[lru]);
-+	else
-+		list_del_init(&folio->lru);
++	/*
++	 * Hand the folio to its legacy lruvec list and credit
++	 * mz->lru_zone_size, which Marie's per-PFN accounting never touched
++	 * (marie_update_lru_size deliberately skips it). PG_lru is
++	 * re-published below, and the PG_lru=1 invariant is "on a real
++	 * lruvec list AND counted in mz->lru_zone_size".
++	 *
++	 * This MUST cover LRU_UNEVICTABLE the same way -- generic
++	 * lruvec_add_folio places unevictable folios on
++	 * lists[LRU_UNEVICTABLE] and counts them. The earlier
++	 * list_del_init()+skip special-case orphaned a re-published-PG_lru
++	 * folio off every list while uncounted; when exit_mmap later
++	 * munlocked and freed it, the generic lruvec_del_folio decremented
++	 * an mz->lru_zone_size bucket Marie never +1'd -> the
++	 * mem_cgroup_update_lru_size "lru_size -1" underflow WARN, followed
++	 * by a corrupted-rmap Oops in shrink_folio_list. Only reachable via
++	 * marie_drop_lruvec (memcg offline), so swap/KVM tests without
++	 * cgroup churn never exercised it.
++	 */
++	list_move(&folio->lru, &lruvec->lists[lru]);
 +
 +	marie_pc_add(&mlv->types[type].nr_pages, -nr);
 +	marie_pc_add(&marie_nr_folios, -1);
 +	marie_pc_add(&mlv->marie_lru_zone_size[lru][z], -nr);
 +#ifdef CONFIG_MEMCG
-+	if (lru != LRU_UNEVICTABLE)
-+		mem_cgroup_update_lru_size(lruvec, lru, z, nr);
++	mem_cgroup_update_lru_size(lruvec, lru, z, nr);
 +#endif
 +
 +	/* Re-publish on the legacy LRU and drop our pin. */
@@ -2594,10 +2588,10 @@ index 0000000000..bf62467812
 +/*
 + * Per-lruvec body of marie_change_state. Acquires lru_lock with IRQs
 + * off (drain/fill require it), invokes the appropriate transition,
-+ * releases, then runs marie_drop_lruvec outside lru_lock so the
-+ * synchronize_rcu inside drop_lruvec can sleep.
++ * releases, then runs marie_drop_lruvec outside lru_lock (it frees the
++ * mlv after dropping the lock).
 + *
-+ * marie_drop_lruvec is idempotent (xa_erase returns NULL on a second
++ * marie_drop_lruvec is idempotent (lv->marie_mlv reads NULL on a second
 + * visit), so this helper is safe to call on lruvecs that never carried
 + * an mlv.
 + */
@@ -2746,12 +2740,14 @@ index 0000000000..bf62467812
 +__setup("lru_marie=", marie_setup);
 +
 +
-+void lru_marie_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
++unsigned int lru_marie_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 +{
 +	/*
-+	 * Per-PFN bitmap scan is the sole reclaim driver in Marie.
++	 * Per-PFN bitmap scan is the sole reclaim driver in Marie. The
++	 * returned MARIE_DRAIN_* mask tells shrink_lruvec which orphan type(s)
++	 * its legacy drain may reclaim (exactly the type(s) Marie scanned).
 +	 */
-+	marie_state_shrink_lruvec(lruvec, sc);
++	return marie_state_shrink_lruvec(lruvec, sc);
 +}
 +
 +/*
@@ -2997,32 +2993,6 @@ index 0000000000..bf62467812
 +unsigned long marie_walker_interval_normal   = HZ / 4;
 +unsigned long marie_walker_interval_idle     = HZ;
 +
-+/*
-+ * marie_oom_min_free_kbytes — early-OOM watermark (KiB) consumed by
-+ * mm/page_alloc.c:should_reclaim_retry.
-+ *
-+ * Combined RAM+swap free-pages floor below which the allocator
-+ * slowpath stops retrying and lets the OOM killer fire. Defends
-+ * against reclaim livelock under sustained anonymous pressure where
-+ * Marie keeps returning "did_some_progress" while a fast allocator
-+ * drains the freed pages instantly and per-zone __zone_watermark_ok
-+ * keeps saying "we could succeed if everything was reclaimed".
-+ *
-+ * The same gate also short-circuits when nr_swap_write_failed has
-+ * advanced by more than MAX_SWAP_WRITE_FAIL_RETRIES during this
-+ * allocation attempt -- i.e. the swap backend (commonly ZRAM/zswap
-+ * zs_malloc starvation) has stopped accepting writes even though
-+ * get_nr_swap_pages() still reports free entries.
-+ *
-+ * 0 = disabled (legacy retry behaviour). marie_init() auto-defaults
-+ * this to ~1% of total RAM (clamped to [4 MiB .. 512 MiB]) at boot if
-+ * userspace has not set it via sysfs first.
-+ *
-+ * Gated by lru_marie_enabled() at the read site so MGLRU/Legacy
-+ * builds (Marie runtime-off) keep vanilla retry semantics.
-+ */
-+unsigned long marie_oom_min_free_kbytes;
-+
 +static ssize_t gen_growth_threshold_show(struct kobject *kobj,
 +					 struct kobj_attribute *attr,
 +					 char *buf)
@@ -3049,34 +3019,6 @@ index 0000000000..bf62467812
 +
 +static struct kobj_attribute marie_gen_growth_threshold_attr =
 +	__ATTR_RW(gen_growth_threshold);
-+
-+static ssize_t oom_min_free_kbytes_show(struct kobject *kobj,
-+					struct kobj_attribute *attr,
-+					char *buf)
-+{
-+	return sysfs_emit(buf, "%lu\n",
-+			  READ_ONCE(marie_oom_min_free_kbytes));
-+}
-+
-+static ssize_t oom_min_free_kbytes_store(struct kobject *kobj,
-+					 struct kobj_attribute *attr,
-+					 const char *buf, size_t count)
-+{
-+	unsigned long v;
-+	int err = kstrtoul(buf, 10, &v);
-+
-+	if (err)
-+		return err;
-+	/* Cap at INT_MAX to keep the value comparable against KiB-typed
-+	 * accumulations (NR_FREE_PAGES + get_nr_swap_pages() << PAGE_SHIFT - 10). */
-+	if (v > (unsigned long)INT_MAX)
-+		return -EINVAL;
-+	WRITE_ONCE(marie_oom_min_free_kbytes, v);
-+	return count;
-+}
-+
-+static struct kobj_attribute marie_oom_min_free_kbytes_attr =
-+	__ATTR_RW(oom_min_free_kbytes);
 +
 +/*
 + * Walker-interval knob factory: every stage uses the same show/store
@@ -3133,7 +3075,6 @@ index 0000000000..bf62467812
 +	&marie_simd_attr.attr,
 +#endif
 +	&marie_gen_growth_threshold_attr.attr,
-+	&marie_oom_min_free_kbytes_attr.attr,
 +	&marie_walker_interval_critical_ms_attr.attr,
 +	&marie_walker_interval_low_ms_attr.attr,
 +	&marie_walker_interval_normal_ms_attr.attr,
@@ -3181,21 +3122,6 @@ index 0000000000..bf62467812
 +			pr_warn("disabled: marie_state_init failed (%d)\n",
 +				err);
 +		}
-+	}
-+
-+	/*
-+	 * Auto-default marie_oom_min_free_kbytes to 1% of total RAM
-+	 * (clamped to [4 MiB .. 512 MiB]) if userspace has not set a value
-+	 * via the sysfs attribute earlier. The runtime gate in
-+	 * should_reclaim_retry pairs this with lru_marie_enabled().
-+	 */
-+	if (READ_ONCE(marie_oom_min_free_kbytes) == 0) {
-+		unsigned long ram_kb = totalram_pages() << (PAGE_SHIFT - 10);
-+		unsigned long auto_kb = clamp(ram_kb / 100, 4096UL, 524288UL);
-+
-+		WRITE_ONCE(marie_oom_min_free_kbytes, auto_kb);
-+		pr_info("oom_min_free_kbytes defaulted to %lu KiB (1%% of %lu KiB RAM)\n",
-+			auto_kb, ram_kb);
 +	}
 +
 +	/*
@@ -4303,10 +4229,10 @@ index 0000000000..4646ca1b9c
 +SYM_FUNC_END(lru_marie_simd_scan_sse2)
 diff --git a/mm/lru_marie/state.c b/mm/lru_marie/state.c
 new file mode 100644
-index 0000000000..53e6d98fd7
+index 0000000000..5ba608782c
 --- /dev/null
 +++ b/mm/lru_marie/state.c
-@@ -0,0 +1,2500 @@
+@@ -0,0 +1,2594 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Marie per-PFN state array — allocation, init, and global counters.
@@ -4339,6 +4265,7 @@ index 0000000000..53e6d98fd7
 +#include <linux/mm.h>
 +#include <linux/mm_inline.h>
 +#include <linux/mmzone.h>
++#include <linux/oom.h>
 +#include <linux/printk.h>
 +#include <linux/swap.h>
 +#include <linux/vmalloc.h>
@@ -5449,6 +5376,52 @@ index 0000000000..53e6d98fd7
 +}
 +
 +/*
++ * marie_file_floor_protect - is the clean_min_ratio file floor in force?
++ *
++ * Returns true when this node's clean file pagecache has fallen below
++ * marie_clean_min_ratio (% of node_present_pages) and Marie still has
++ * anon to absorb the pressure, so file reclaim must be withheld. The pick
++ * driver diverts file -> anon on this signal (skip_file) and folds the
++ * result into the MARIE_DRAIN_* mask it returns, so shrink_lruvec's legacy
++ * orphan drain spares file too. No reclaim path may evict file below the
++ * floor -- le9uo's single-path floor invariant applied across Marie's paths.
++ *
++ * Only CLEAN file counts toward the floor (NR_FILE_DIRTY subtracted):
++ * dirty pages cannot be reclaimed without writeback, so counting them
++ * would let the floor be satisfied by unreclaimable pages and strand the
++ * clean working set.
++ *
++ * If anon is empty Marie has no reserve to protect anyway, so the floor
++ * yields and file scan proceeds as a last resort. An OOM victim bypasses
++ * the floor entirely (its file is fair game; see the oom_victim handling
++ * in marie_state_shrink_lruvec).
++ */
++static bool marie_file_floor_protect(struct pglist_data *pgdat)
++{
++	unsigned int min_ratio = READ_ONCE(marie_clean_min_ratio);
++	unsigned long file_pages, dirty, file_min;
++	long anon_occupied = 0;
++	int g;
++
++	if (!min_ratio || unlikely(tsk_is_oom_victim(current)))
++		return false;
++
++	file_pages = node_page_state(pgdat, NR_ACTIVE_FILE) +
++		     node_page_state(pgdat, NR_INACTIVE_FILE);
++	dirty = node_page_state(pgdat, NR_FILE_DIRTY);
++	file_pages = (file_pages > dirty) ? file_pages - dirty : 0;
++	file_min = pgdat->node_present_pages * min_ratio / 100;
++
++	if (file_pages >= file_min)
++		return false;
++
++	for (g = 0; g < MARIE_PFN_NR_GENS; g++)
++		anon_occupied += atomic_long_read(&marie_gen_occupied[g][0]);
++
++	return anon_occupied > 0;
++}
++
++/*
 + * marie_state_shrink_lruvec - per-PFN paradigm reclaim driver.
 + *
 + * At entry, for each type, fire the reclaim-driven aging trigger:
@@ -5477,7 +5450,7 @@ index 0000000000..53e6d98fd7
 + * PG_active/PG_workingset).
 + */
 +
-+void marie_state_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
++unsigned int marie_state_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 +{
 +	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 +	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
@@ -5511,6 +5484,7 @@ index 0000000000..53e6d98fd7
 +	int type_count;
 +	int idx;
 +	bool skip_file = false;
++	unsigned int drain_mask;
 +	/*
 +	 * When anon cannot be reclaimed at all (no free swap slots,
 +	 * cgroup swap limit hit, no demotion target), swappiness is by
@@ -5523,17 +5497,80 @@ index 0000000000..53e6d98fd7
 +	 * Drop the stubborn swappiness preference and force FILE only,
 +	 * mirroring get_scan_count()'s "!can_reclaim_anon_pages ->
 +	 * SCAN_FILE". The clean_min_ratio floor below still applies, so
-+	 * file is reclaimed only down to the protected floor; past it the
-+	 * caller's early-OOM gate (should_reclaim_retry) fires.
++	 * file is reclaimed only down to the protected floor; once file is
++	 * at the floor and anon is unreclaimable this pass reclaims nothing,
++	 * and the stock no_progress_loops path in should_reclaim_retry()
++	 * reaches the OOM killer.
 +	 */
 +	bool anon_unreclaimable =
 +		!vmscan_can_reclaim_anon_pages(memcg, pgdat->node_id, sc);
++	/*
++	 * An OOM victim's own direct reclaim runs FILE-only, with no holds
++	 * barred on the file side: scan FILE ignoring the swappiness/bias
++	 * pick, the clean_min_ratio floor, the FILE_THEN_ANON tail gate and
++	 * the bias controller. The task has been selected for death and the
++	 * OOM reaper frees its anon, so swapping anon here would only add
++	 * I/O thrash for no benefit -- reclaim just the cheap, no-I/O file
++	 * side (clean_min_ratio is bypassed below, so all file is fair
++	 * game). If file is exhausted the victim falls back on the reaper,
++	 * which is the normal OOM mechanism. kswapd is never an OOM victim,
++	 * so background reclaim is unaffected.
++	 */
++	bool oom_victim = tsk_is_oom_victim(current);
 +	int type;
 +
-+	if (anon_unreclaimable)
++	for (type = 0; type < ANON_AND_FILE; type++)
++		if (marie_occupied_gen_count(type) < 2)
++			marie_try_advance_head(type);
++
++	/*
++	 * clean_min_ratio hard floor. True when this node's clean file
++	 * pagecache is below the configured percentage of node_present_pages
++	 * (and anon remains, and we are not an OOM victim). The same predicate
++	 * masks the legacy drain's file scan in shrink_lruvec, so no path
++	 * evicts file below the floor (le9uo's single-path floor invariant).
++	 */
++	skip_file = marie_file_floor_protect(pgdat);
++
++	/*
++	 * Choose the type(s) to scan as a strict priority cascade:
++	 *
++	 *   oom_victim         -> FILE only. The victim's anon is reaped by the
++	 *                         OOM reaper, so swapping anon is pure I/O thrash;
++	 *                         reclaim the cheap no-I/O file side. The floor is
++	 *                         bypassed for victims (skip_file is false), so
++	 *                         file scans freely.
++	 *   anon_unreclaimable -> FILE only. No free swap slots / no demotion
++	 *                         target: swappiness is meaningless and every ANON
++	 *                         pick would free nothing. If file is also at the
++	 *                         floor the per-iteration gate no-ops the file
++	 *                         scan and the stock no_progress_loops path OOMs.
++	 *   swappiness == 0     -> FILE only. Hard "never swap" user policy: the
++	 *                         clean_min_ratio floor must NOT punch through it
++	 *                         (core.c). At the floor file is blocked too, so
++	 *                         this OOMs rather than swapping -- the contract.
++	 *   skip_file          -> ANON only. The floor is in force and file is
++	 *                         protected, so divert all reclaim to anon
++	 *                         regardless of the swappiness/bias pick. This
++	 *                         outranks the proportional controller: a
++	 *                         FILE_FIRST pick would otherwise scan the
++	 *                         floor-blocked file side, free nothing, and --
++	 *                         the bias being frozen during skip_file -- stay
++	 *                         pinned on FILE while anon is never picked,
++	 *                         stalling reclaim under pressure at high swappiness.
++	 *   otherwise          -> the swappiness / swap_bias proportional pick.
++	 */
++	if (oom_victim)
 +		pick_kind = MARIE_PICK_FILE_STRICT;
++	else if (anon_unreclaimable)
++		pick_kind = MARIE_PICK_FILE_STRICT;
++	else if (swappiness == 0)
++		pick_kind = MARIE_PICK_FILE_STRICT;
++	else if (skip_file)
++		pick_kind = MARIE_PICK_ANON_STRICT;
 +	else
 +		pick_kind = marie_swap_pick_type(mlv_bias, swappiness);
++
 +	switch (pick_kind) {
 +	case MARIE_PICK_FILE_STRICT:
 +		type_order[0] = 1;
@@ -5574,39 +5611,18 @@ index 0000000000..53e6d98fd7
 +		break;
 +	}
 +
-+	for (type = 0; type < ANON_AND_FILE; type++)
-+		if (marie_occupied_gen_count(type) < 2)
-+			marie_try_advance_head(type);
-+
 +	/*
-+	 * clean_min_ratio hard floor: divert file -> anon when the
-+	 * node's file pagecache falls below the configured percentage
-+	 * of node_present_pages. If anon is also empty Marie has no
-+	 * file reserve to protect anyway -- fall through and let file
-+	 * scan proceed as a last resort.
++	 * Tell shrink_lruvec which orphan type(s) its legacy drain may
++	 * reclaim: exactly the type this call scans. type_order[0] is the
++	 * primary (and, in the single-type regime, only) type. A file pick
++	 * blocked by skip_file (FILE_STRICT under the clean_min_ratio floor)
++	 * scans nothing, so it grants no drain -- preserving the
++	 * no-progress -> OOM path.
 +	 */
-+	{
-+		unsigned int min_ratio = READ_ONCE(marie_clean_min_ratio);
-+
-+		if (min_ratio) {
-+			unsigned long file_pages =
-+				node_page_state(pgdat, NR_ACTIVE_FILE) +
-+				node_page_state(pgdat, NR_INACTIVE_FILE);
-+			unsigned long file_min =
-+				pgdat->node_present_pages * min_ratio / 100;
-+
-+			if (file_pages < file_min) {
-+				int g;
-+				long anon_occupied = 0;
-+
-+				for (g = 0; g < MARIE_PFN_NR_GENS; g++)
-+					anon_occupied += atomic_long_read(
-+						&marie_gen_occupied[g][0]);
-+				if (anon_occupied > 0)
-+					skip_file = true;
-+			}
-+		}
-+	}
++	if (type_order[0] == 1)
++		drain_mask = skip_file ? 0 : MARIE_DRAIN_FILE;
++	else
++		drain_mask = MARIE_DRAIN_ANON;
 +
 +	{
 +		/*
@@ -5969,10 +5985,12 @@ index 0000000000..53e6d98fd7
 +			 * rule -- the bias must resume cleanly once swap
 +			 * capacity returns and can_reclaim_anon flips back).
 +			 */
-+			if (attempted_pick && !skip_file && !anon_unreclaimable)
++			if (attempted_pick && !skip_file && !anon_unreclaimable &&
++			    likely(!oom_victim))
 +				marie_swap_bias_update(mlv_bias, type,
 +						       n_reclaimed, swappiness);
-+			if (pick_kind == MARIE_PICK_FILE_THEN_ANON &&
++			if (likely(!oom_victim) &&
++			    pick_kind == MARIE_PICK_FILE_THEN_ANON &&
 +			    idx == 0 && !skip_file)
 +				break;
 +		}
@@ -5980,6 +5998,8 @@ index 0000000000..53e6d98fd7
 +		if (using_percpu)
 +			atomic_set(&buf->in_use, 0);
 +	}
++
++	return drain_mask;
 +}
 +
 +
@@ -6809,10 +6829,10 @@ index 0000000000..53e6d98fd7
 +}
 diff --git a/mm/lru_marie/state.h b/mm/lru_marie/state.h
 new file mode 100644
-index 0000000000..1f2cbdcf03
+index 0000000000..be174a271e
 --- /dev/null
 +++ b/mm/lru_marie/state.h
-@@ -0,0 +1,1295 @@
+@@ -0,0 +1,1293 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _MM_LRU_MARIE_STATE_H
 +#define _MM_LRU_MARIE_STATE_H
@@ -7271,8 +7291,8 @@ index 0000000000..1f2cbdcf03
 + * shrink_folio_list, and putbacks any survivors. Sole reclaim
 + * driver in PFN-only Marie.
 + */
-+void marie_state_shrink_lruvec(struct lruvec *lruvec,
-+			       struct scan_control *sc);
++unsigned int marie_state_shrink_lruvec(struct lruvec *lruvec,
++				       struct scan_control *sc);
 +
 +/*
 + * Marie type-pick return codes for marie_swap_pick_type().
@@ -8079,12 +8099,10 @@ index 0000000000..1f2cbdcf03
 + */
 +
 +/*
-+ * Per-lruvec mlv side-channel. Indexed by struct lruvec *. Lazy alloc on
-+ * first hit; freed at memcg teardown via marie_drop_lruvec(). Walker
-+ * iterates this xarray under rcu_read_lock to find mlv's for a target
-+ * pgdat; the dispatch hooks xa_load() it directly.
++ * Per-lruvec mlv lives in lv->marie_mlv (the single source of truth;
++ * lazy-allocated on first hit via cmpxchg, freed at memcg teardown via
++ * marie_drop_lruvec()). No side xarray, no RCU.
 + */
-+extern struct xarray marie_lruvec_xa;
 +
 +/*
 + * marie_walk_pgdat - run one walker pass for @pgdat.
@@ -8110,7 +8128,7 @@ index 0000000000..1f2cbdcf03
 +#endif /* _MM_LRU_MARIE_STATE_H */
 diff --git a/mm/lru_marie/version.h b/mm/lru_marie/version.h
 new file mode 100644
-index 0000000000..03b83475b9
+index 0000000000..c3f75cd96b
 --- /dev/null
 +++ b/mm/lru_marie/version.h
 @@ -0,0 +1,22 @@
@@ -8133,15 +8151,15 @@ index 0000000000..03b83475b9
 +#define MARIE_PROGNAME	"Marie LRU"
 +#define MARIE_AUTHOR	"Masahito Suzuki"
 +
-+#define MARIE_VERSION	"0.2.1"
++#define MARIE_VERSION	"0.2.2"
 +
 +#endif /* _MM_LRU_MARIE_VERSION_H */
 diff --git a/mm/lru_marie/walker.c b/mm/lru_marie/walker.c
 new file mode 100644
-index 0000000000..ef088c9e6d
+index 0000000000..0153903dfe
 --- /dev/null
 +++ b/mm/lru_marie/walker.c
-@@ -0,0 +1,1018 @@
+@@ -0,0 +1,960 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * mm/lru_marie/walker.c — Marie's SIMD-accelerated PTE walker.
@@ -8888,16 +8906,14 @@ index 0000000000..ef088c9e6d
 +			mlv = arg->mlv_file_cache;
 +		} else {
 +			/*
-+			 * RCU read-side: pairs with synchronize_rcu() in
-+			 * marie_drop_lruvec(). The cached @mlv is then valid
-+			 * for the rest of this walker pass because the
-+			 * outer pgdat walk runs with preempt_disable(),
-+			 * which keeps an implicit RCU read-side held for
-+			 * the lifetime of the cached pointer.
++			 * lv->marie_mlv is authoritative (no side xarray) and
++			 * stays valid for the rest of this pass without RCU:
++			 * the folios being walked are mapped in this mmget'd mm
++			 * and therefore charged, which pins their memcg ->
++			 * lruvec -> mlv alive (mlv is freed only at
++			 * mem_cgroup_free).
 +			 */
-+			rcu_read_lock();
-+			mlv = xa_load(&marie_lruvec_xa, (unsigned long)lv);
-+			rcu_read_unlock();
++			mlv = READ_ONCE(lv->marie_mlv);
 +			if (!mlv)
 +				continue;
 +			if (type == 0)
@@ -8971,8 +8987,6 @@ index 0000000000..ef088c9e6d
 +		 */
 +		.force_scan = false,
 +	};
-+	unsigned long idx;
-+	struct marie_lruvec *mlv;
 +	int i;
 +
 +	if (nid >= MAX_NUMNODES)
@@ -9038,84 +9052,30 @@ index 0000000000..ef088c9e6d
 +	}
 +
 +	/*
-+	 * Pass-end housekeeping: bump per-gen walker_visits, per type
-+	 * sequentially. (Saturated promotes are already materialised
-+	 * inline by marie_state_inc_tier inside the per-PMD loop, so
-+	 * no drain step is needed here.)
++	 * Pass-end housekeeping: mark every (gen, type) as walker-visited.
 +	 *
-+	 * Each type's lock is acquired in its own scope, so an isolation
-+	 * pass for type B can proceed in parallel while walker is finishing
-+	 * type A's housekeeping.
++	 * marie_gen_walker_visits is a GLOBAL [gen][type] counter read only
++	 * as a >= 1 boolean -- marie_state_shrink_lruvec gates
++	 * ignore_references on "walker has visited this gen at least once",
++	 * and the slot is reset to 0 in marie_try_advance_head on recycle.
++	 * A single bump per pass is therefore equivalent to the former
++	 * per-mlv bump, and there is no per-mlv state to touch here: walker
++	 * tier saturate is materialised inline by marie_state_inc_tier
++	 * during the per-PMD walk, so no promote-queue drain accumulates.
 +	 *
-+	 * rcu_read_lock() pairs with the synchronize_rcu() + direct free in
-+	 * marie_drop_lruvec(): a concurrent memcg teardown that erases
-+	 * @mlv from the xarray cannot reclaim its memory until this
-+	 * iteration releases the RCU read-side. Taking a per-type spin_lock
-+	 * is permitted inside an RCU read-side critical section.
++	 * This replaces the former xa_for_each(&marie_lruvec_xa) -- the only
++	 * full traversal of that xarray, and the rcu_read_lock it ran under.
++	 * mlv lifetime is now tied to the lruvec/memcg (lv->marie_mlv), so
++	 * neither the traversal nor marie_drop_lruvec's synchronize_rcu() is
++	 * needed.
 +	 */
-+	rcu_read_lock();
-+	xa_for_each(&marie_lruvec_xa, idx, mlv) {
-+		int t;
++	{
++		int t, g;
 +
-+		if (mlv->nid != nid)
-+			continue;
-+
-+		/*
-+		 * Pin to the current CPU across this per-mlv pass.
-+		 *
-+		 * The per-type bump increments per-CPU counters under the
-+		 * marie_drain_depth contract inside marie_type_lock; the
-+		 * inner scoped_guard expects a stable CPU for its
-+		 * this_cpu_inc/dec pair. migrate_disable() prevents the
-+		 * task from migrating between the per-type guard's
-+		 * enter/exit and is strictly weaker than preempt_disable
-+		 * under PREEMPT_RT (preferred for "pin CPU for per-CPU
-+		 * data" without blocking RT preemption).
-+		 */
-+		migrate_disable();
-+
-+		for (t = 0; t < ANON_AND_FILE; t++) {
-+			/*
-+			 * Lock order: lru_lock outer, per-type lock inner —
-+			 * matches the ordering install / evict /
-+			 * marie_state_shrink_lruvec use. mz->lru_zone_size is
-+			 * intentionally NOT touched by Marie (see
-+			 * marie_update_lru_size in state.h).
-+			 */
-+			scoped_guard(spinlock_irq, &mlv->lruvec->lru_lock)
-+			scoped_guard(marie_type_lock, &mlv->types[t]) {
-+				/*
-+				 * No promote-queue drain: walker tier saturate
-+				 * is synchronous in marie_state_inc_tier
-+				 * (marie_state_move_to_gen runs inline), so no
-+				 * pending work accumulates per-type.
-+				 */
-+
-+				/*
-+				 * Bump walker_visits for every PFN-gen of
-+				 * this type so marie_state_shrink_lruvec
-+				 * can gate ignore_references on "walker has
-+				 * visited this gen at least once". Slot reset
-+				 * back to zero happens inside
-+				 * marie_try_advance_head when the slot
-+				 * recycles.
-+				 */
-+				{
-+					int g_idx;
-+
-+					for (g_idx = 0;
-+					     g_idx < MARIE_PFN_NR_GENS;
-+					     g_idx++)
-+						atomic_inc(&marie_gen_walker_visits
-+							    [g_idx][t]);
-+				}
-+
-+			}
-+		}
-+
-+		migrate_enable();
++		for (t = 0; t < ANON_AND_FILE; t++)
++			for (g = 0; g < MARIE_PFN_NR_GENS; g++)
++				atomic_inc(&marie_gen_walker_visits[g][t]);
 +	}
-+	rcu_read_unlock();
 +
 +	/*
 +	 * Pass-end bloom rotation: the inactive filter has accumulated
@@ -9161,7 +9121,7 @@ index 0000000000..ef088c9e6d
 +		spin_lock_init(&marie_blooms[nid].lock);
 +}
 diff --git a/mm/memcontrol-v1.c b/mm/memcontrol-v1.c
-index 597af8a801..a677673f62 100644
+index 597af8a801..281ca8d803 100644
 --- a/mm/memcontrol-v1.c
 +++ b/mm/memcontrol-v1.c
 @@ -11,6 +11,7 @@
@@ -9180,7 +9140,7 @@ index 597af8a801..a677673f62 100644
 +	/*
 +	 * Notify Marie so its per-lruvec swap_bias controllers reset to
 +	 * neutral under the new value. lru_marie_swappiness_changed
-+	 * walks marie_lruvec_xa once -- the reset is unconditional, not
++	 * walks every lruvec once -- the reset is unconditional, not
 +	 * scoped to @memcg, because the controller's only state is the
 +	 * bias counter and an extra reset on unaffected lruvecs is
 +	 * harmless. See lru_marie.h.
@@ -9244,7 +9204,7 @@ index df34797691..5749c9b46c 100644
  
  	for (i = 0; i < NR_VMSCAN_THROTTLE; i++)
 diff --git a/mm/page_alloc.c b/mm/page_alloc.c
-index 2d4b6f1a55..d698e938a8 100644
+index 2d4b6f1a55..83db7e6665 100644
 --- a/mm/page_alloc.c
 +++ b/mm/page_alloc.c
 @@ -16,6 +16,7 @@
@@ -9284,61 +9244,45 @@ index 2d4b6f1a55..d698e938a8 100644
  	if (memcg_kmem_online() && PageMemcgKmem(page))
  		__memcg_kmem_uncharge_page(page, order);
  
-@@ -4618,6 +4641,61 @@ should_reclaim_retry(gfp_t gfp_mask, unsigned order,
+@@ -4618,6 +4641,45 @@ should_reclaim_retry(gfp_t gfp_mask, unsigned order,
  	if (*no_progress_loops > MAX_RECLAIM_RETRIES)
  		goto out;
  
 +#ifdef CONFIG_LRU_MARIE
 +	/*
-+	 * Early-OOM watermark, exposed via the Marie sysfs attribute
-+	 * /sys/kernel/mm/lru_marie/oom_min_free_kbytes.
++	 * Marie swap-backend-failure OOM trigger.
 +	 *
-+	 * If Marie owns the LRU and the user-set floor (auto-defaulted to
-+	 * ~1% of RAM by marie_init) has been crossed by RAM+swap free
-+	 * pages, abandon retry and let the OOM killer fire. Avoids reclaim
-+	 * livelock where Marie keeps returning "did_some_progress" while a
-+	 * fast allocator drains the freed pages instantly and per-zone
-+	 * __zone_watermark_ok keeps saying "we could succeed if everything
-+	 * was reclaimed".
++	 * Catches "get_nr_swap_pages() > 0 but writes still fail" — primarily
++	 * ZRAM/zswap zs_malloc starvation when free RAM cannot satisfy the
++	 * compression buffer, but also disk swap I/O errors. In this state
++	 * can_reclaim_anon_pages() still reports true (slots appear free), so
++	 * the pick driver keeps attempting anon swapout that never completes;
++	 * left to run it grinds the file working set down to the clean_min_ratio
++	 * floor before the no-progress path finally OOMs. Trip OOM as soon as
++	 * the backend has rejected more than MAX_SWAP_WRITE_FAIL_RETRIES writes
++	 * during this allocation, well before that grind. The threshold
++	 * tolerates a handful of transient failures (concurrent ZRAM ops, brief
++	 * retry windows).
 +	 *
-+	 * MGLRU/Legacy builds (lru_marie_enabled()=false) keep vanilla
-+	 * retry semantics so this code does not leak into baseline
-+	 * comparisons.
++	 * The free+swap exhaustion case needs no early watermark here: the pick
++	 * driver and the legacy drain both withhold file reclaim at the
++	 * clean_min_ratio floor (marie_file_floor_protect), so once file is at
++	 * the floor and anon is unreclaimable reclaim returns no progress and
++	 * the stock no_progress_loops path OOMs promptly — mirroring le9uo's
++	 * reliance on the no-progress path at any floor size.
++	 *
++	 * Skipped for reserve / OOM-victim allocations (ALLOC_OOM,
++	 * ALLOC_NO_WATERMARKS, tsk_is_oom_victim): those contexts exist to let a
++	 * dying system make forward progress. MGLRU/Legacy builds
++	 * (lru_marie_enabled()=false) keep vanilla retry semantics so this does
++	 * not leak into baseline comparisons.
 +	 */
-+	if (lru_marie_enabled() && READ_ONCE(marie_oom_min_free_kbytes) > 0) {
-+		unsigned long floor_kb = READ_ONCE(marie_oom_min_free_kbytes);
-+		unsigned long total_free_kb;
-+		long swap_fail_delta;
++	if (lru_marie_enabled() &&
++	    likely(!(alloc_flags & (ALLOC_OOM | ALLOC_NO_WATERMARKS))) &&
++	    likely(!tsk_is_oom_victim(current))) {
++		long swap_fail_delta = atomic_long_read(&nr_swap_write_failed) -
++				       ac->initial_swap_write_failed;
 +
-+		/*
-+		 * (1) Total free cushion (RAM + swap) below the floor — the
-+		 * historical early-OOM trigger. Catches plain OOM and
-+		 * swap-fully-exhausted-with-low-RAM.
-+		 */
-+		total_free_kb = (global_zone_page_state(NR_FREE_PAGES) +
-+				 get_nr_swap_pages()) << (PAGE_SHIFT - 10);
-+		if (total_free_kb < floor_kb) {
-+			unsigned int min_ratio = READ_ONCE(marie_clean_min_ratio);
-+			unsigned long file_pages =
-+				global_node_page_state(NR_ACTIVE_FILE) +
-+				global_node_page_state(NR_INACTIVE_FILE);
-+			unsigned long file_min = totalram_pages() * min_ratio / 100;
-+
-+			if (min_ratio == 0 || file_pages < file_min)
-+				goto out;
-+		}
-+
-+		/*
-+		 * (2) Swap backend has rejected writes during this allocation.
-+		 * Catches "get_nr_swap_pages() > 0 but writes still fail"
-+		 * — primarily ZRAM/zswap zs_malloc starvation when free RAM
-+		 * cannot satisfy the compression buffer, but also disk swap
-+		 * I/O errors. Threshold tolerates a handful of transient
-+		 * failures (concurrent ZRAM ops, brief retry windows) but
-+		 * trips OOM well before the full MAX_RECLAIM_RETRIES wait.
-+		 */
-+		swap_fail_delta = atomic_long_read(&nr_swap_write_failed) -
-+				  ac->initial_swap_write_failed;
 +		if (swap_fail_delta > MAX_SWAP_WRITE_FAIL_RETRIES)
 +			goto out;
 +	}
@@ -9346,7 +9290,7 @@ index 2d4b6f1a55..d698e938a8 100644
  
  	/*
  	 * Keep reclaiming pages while there is a chance this will lead
-@@ -4741,6 +4819,20 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+@@ -4741,6 +4803,20 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
  		WARN_ON_ONCE(current->flags & PF_MEMALLOC);
  	}
  
@@ -9815,7 +9759,7 @@ index bfafa637c4..3808a5af93 100644
  /* linux/mm/swap_state.c */
  extern struct address_space swap_space __read_mostly;
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index 0fc9373e82..76d2903d40 100644
+index 0fc9373e82..cd22ce7646 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
 @@ -39,6 +39,7 @@
@@ -10068,26 +10012,61 @@ index 0fc9373e82..76d2903d40 100644
  static void lru_gen_change_state(bool enabled)
  {
  	static DEFINE_MUTEX(state_mutex);
-@@ -5780,6 +5953,18 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+@@ -5779,7 +5952,23 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ 	unsigned long nr_to_reclaim = sc->nr_to_reclaim;
  	bool proportional_reclaim;
  	struct blk_plug plug;
++#ifdef CONFIG_LRU_MARIE
++	unsigned int marie_drain_mask = MARIE_DRAIN_ANON | MARIE_DRAIN_FILE;
++#endif
  
 +#ifdef CONFIG_LRU_MARIE
 +	if (lru_marie_enabled()) {
-+		lru_marie_shrink_lruvec(lruvec, sc);
++		marie_drain_mask = lru_marie_shrink_lruvec(lruvec, sc);
 +		/*
-+		 * Fall through to the legacy reclaim path below — MGLRU is
-+		 * bypassed when lru_marie_enabled(), so any folios that escaped
-+		 * to legacy lists due to lru_marie_add_folio allocation failures
-+		 * must be drained here.  Common case: legacy lists are empty
-+		 * and get_scan_count() returns zeros, making this a cheap no-op.
++		 * Fall through to the legacy reclaim path below to drain orphan
++		 * folios (failed Marie install, drain/reparent handoffs) that
++		 * landed on lruvec->lists; MGLRU is bypassed under Marie. The
++		 * drain is constrained by marie_drain_mask below so it touches
++		 * only the type(s) Marie scanned. Common case: the lists are
++		 * empty and this is a cheap no-op.
 +		 */
 +	} else
 +#endif
  	if (lru_gen_enabled() && !root_reclaim(sc)) {
  		lru_gen_shrink_lruvec(lruvec, sc);
  		return;
-@@ -6042,11 +6227,27 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+@@ -5787,6 +5976,29 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ 
+ 	get_scan_count(lruvec, sc, nr);
+ 
++#ifdef CONFIG_LRU_MARIE
++	/*
++	 * Constrain the legacy orphan drain to the type(s) Marie's pick driver
++	 * actually scanned this call (marie_drain_mask). Stock get_scan_count's
++	 * policy (SCAN_EQUAL at sc->priority==0, SCAN_ANON on file_is_tiny)
++	 * ignores Marie's swappiness / clean_min_ratio / ANON_STRICT decisions
++	 * and would otherwise cut the protected type behind the driver's back
++	 * (e.g. evicting file at vm.swappiness=200, or swapping at swappiness=0).
++	 * Zero the nr[] of any type Marie did not scan. Marie-only; the
++	 * legacy/MGLRU nr[] is left byte-identical.
++	 */
++	if (lru_marie_enabled()) {
++		if (!(marie_drain_mask & MARIE_DRAIN_FILE)) {
++			nr[LRU_ACTIVE_FILE] = 0;
++			nr[LRU_INACTIVE_FILE] = 0;
++		}
++		if (!(marie_drain_mask & MARIE_DRAIN_ANON)) {
++			nr[LRU_ACTIVE_ANON] = 0;
++			nr[LRU_INACTIVE_ANON] = 0;
++		}
++	}
++#endif
++
+ 	/* Record the original scan target for proportional adjustments later */
+ 	memcpy(targets, nr, sizeof(nr));
+ 
+@@ -6042,11 +6254,27 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
  	struct lruvec *target_lruvec;
  	bool reclaimable = false;
  
@@ -10115,7 +10094,7 @@ index 0fc9373e82..76d2903d40 100644
  
  	target_lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup, pgdat);
  
-@@ -6315,6 +6516,17 @@ static void snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat)
+@@ -6315,6 +6543,17 @@ static void snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat)
  	struct lruvec *target_lruvec;
  	unsigned long refaults;
  
@@ -10133,7 +10112,7 @@ index 0fc9373e82..76d2903d40 100644
  	if (lru_gen_enabled())
  		return;
  
-@@ -6704,6 +6916,21 @@ static void kswapd_age_node(struct pglist_data *pgdat, struct scan_control *sc)
+@@ -6704,6 +6943,21 @@ static void kswapd_age_node(struct pglist_data *pgdat, struct scan_control *sc)
  	struct mem_cgroup *memcg;
  	struct lruvec *lruvec;
  
@@ -10155,7 +10134,7 @@ index 0fc9373e82..76d2903d40 100644
  	if (lru_gen_enabled()) {
  		lru_gen_age_node(pgdat, sc);
  		return;
-@@ -7474,6 +7701,9 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
+@@ -7474,6 +7728,9 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
  void __meminit kswapd_run(int nid)
  {
  	pg_data_t *pgdat = NODE_DATA(nid);
@@ -10165,7 +10144,7 @@ index 0fc9373e82..76d2903d40 100644
  
  	pgdat_kswapd_lock(pgdat);
  	if (!pgdat->kswapd) {
-@@ -7487,7 +7717,32 @@ void __meminit kswapd_run(int nid)
+@@ -7487,7 +7744,32 @@ void __meminit kswapd_run(int nid)
  		} else {
  			wake_up_process(pgdat->kswapd);
  		}
@@ -10198,7 +10177,7 @@ index 0fc9373e82..76d2903d40 100644
  	pgdat_kswapd_unlock(pgdat);
  }
  
-@@ -7506,16 +7761,60 @@ void __meminit kswapd_stop(int nid)
+@@ -7506,16 +7788,60 @@ void __meminit kswapd_stop(int nid)
  		kthread_stop(kswapd);
  		pgdat->kswapd = NULL;
  	}
