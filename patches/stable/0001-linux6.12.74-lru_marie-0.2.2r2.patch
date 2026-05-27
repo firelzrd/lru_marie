@@ -1,7 +1,7 @@
-From b801ddbfb8e048f1e0733f71d5f78755f8047400 Mon Sep 17 00:00:00 2001
+From 557d6d9124a595dc08616a10fd304c37fad676ab Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
 Date: Tue, 26 May 2026 12:33:31 +0900
-Subject: [PATCH] linux6.12.74-lru_marie-0.2.2
+Subject: [PATCH] linux6.12.74-lru_marie-0.2.2r2
 
 ---
  include/linux/lru_marie.h      |  453 ++++++
@@ -36,8 +36,8 @@ Subject: [PATCH] linux6.12.74-lru_marie-0.2.2
  mm/rmap.c                      |    6 +
  mm/swap.c                      |  102 ++
  mm/swap.h                      |    4 +
- mm/vmscan.c                    |  294 +++-
- 33 files changed, 9542 insertions(+), 10 deletions(-)
+ mm/vmscan.c                    |  295 +++-
+ 33 files changed, 9543 insertions(+), 10 deletions(-)
  create mode 100644 include/linux/lru_marie.h
  create mode 100644 mm/lru_marie/Makefile
  create mode 100644 mm/lru_marie/bitmap.c
@@ -9830,7 +9830,7 @@ index ad2f121de9..6e5477f5ec 100644
  /* linux/mm/swap_state.c */
  /* One swap address space for each 64M swap space */
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index 0ceed77af0..8664a3431d 100644
+index 0ceed77af0..561d21882a 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
 @@ -39,6 +39,7 @@
@@ -9876,7 +9876,7 @@ index 0ceed77af0..8664a3431d 100644
  #ifdef ARCH_HAS_PREFETCHW
  #define prefetchw_prev_lru_folio(_folio, _base, _field)			\
  	do {								\
-@@ -199,7 +228,17 @@ struct scan_control {
+@@ -199,8 +228,19 @@ struct scan_control {
  
  /*
   * From 0 .. MAX_SWAPPINESS.  Higher means more swappy.
@@ -9892,9 +9892,11 @@ index 0ceed77af0..8664a3431d 100644
 +int vm_swappiness = 1;
 +#else
  int vm_swappiness = 60;
++#endif
  
  #ifdef CONFIG_MEMCG
-@@ -403,10 +442,21 @@ static unsigned long lruvec_lru_size(struct lruvec *lruvec, enum lru_list lru,
+ 
+@@ -403,10 +443,21 @@ static unsigned long lruvec_lru_size(struct lruvec *lruvec, enum lru_list lru,
  		if (!managed_zone(zone))
  			continue;
  
@@ -9918,7 +9920,7 @@ index 0ceed77af0..8664a3431d 100644
  	}
  	return size;
  }
-@@ -459,6 +509,45 @@ static int reclaimer_offset(void)
+@@ -459,6 +510,45 @@ static int reclaimer_offset(void)
  	return PGSTEAL_DIRECT - PGSTEAL_KSWAPD;
  }
  
@@ -9964,7 +9966,7 @@ index 0ceed77af0..8664a3431d 100644
  static inline int is_page_cache_freeable(struct folio *folio)
  {
  	/*
-@@ -880,14 +969,35 @@ static enum folio_references folio_check_references(struct folio *folio,
+@@ -880,14 +970,35 @@ static enum folio_references folio_check_references(struct folio *folio,
  		return FOLIOREF_ACTIVATE;
  
  	/*
@@ -10004,7 +10006,7 @@ index 0ceed77af0..8664a3431d 100644
  	if (referenced_ptes) {
  		/*
  		 * All mapped folios start out with page table
-@@ -1044,9 +1154,13 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
+@@ -1044,9 +1155,13 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
  }
  
  /*
@@ -10020,7 +10022,7 @@ index 0ceed77af0..8664a3431d 100644
  		struct pglist_data *pgdat, struct scan_control *sc,
  		struct reclaim_stat *stat, bool ignore_references)
  {
-@@ -5086,6 +5200,55 @@ static bool drain_evictable(struct lruvec *lruvec)
+@@ -5086,6 +5201,55 @@ static bool drain_evictable(struct lruvec *lruvec)
  	return true;
  }
  
@@ -10076,7 +10078,7 @@ index 0ceed77af0..8664a3431d 100644
  static void lru_gen_change_state(bool enabled)
  {
  	static DEFINE_MUTEX(state_mutex);
-@@ -5702,7 +5865,23 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+@@ -5702,7 +5866,23 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
  	unsigned long nr_to_reclaim = sc->nr_to_reclaim;
  	bool proportional_reclaim;
  	struct blk_plug plug;
@@ -10100,7 +10102,7 @@ index 0ceed77af0..8664a3431d 100644
  	if (lru_gen_enabled() && !root_reclaim(sc)) {
  		lru_gen_shrink_lruvec(lruvec, sc);
  		return;
-@@ -5710,6 +5889,29 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+@@ -5710,6 +5890,29 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
  
  	get_scan_count(lruvec, sc, nr);
  
@@ -10130,7 +10132,7 @@ index 0ceed77af0..8664a3431d 100644
  	/* Record the original scan target for proportional adjustments later */
  	memcpy(targets, nr, sizeof(nr));
  
-@@ -5965,10 +6167,25 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+@@ -5965,10 +6168,25 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
  	struct lruvec *target_lruvec;
  	bool reclaimable = false;
  
@@ -10156,7 +10158,7 @@ index 0ceed77af0..8664a3431d 100644
  
  	target_lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup, pgdat);
  
-@@ -6242,6 +6459,17 @@ static void snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat)
+@@ -6242,6 +6460,17 @@ static void snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat)
  	struct lruvec *target_lruvec;
  	unsigned long refaults;
  
@@ -10174,7 +10176,7 @@ index 0ceed77af0..8664a3431d 100644
  	if (lru_gen_enabled())
  		return;
  
-@@ -6633,6 +6861,21 @@ static void kswapd_age_node(struct pglist_data *pgdat, struct scan_control *sc)
+@@ -6633,6 +6862,21 @@ static void kswapd_age_node(struct pglist_data *pgdat, struct scan_control *sc)
  	struct mem_cgroup *memcg;
  	struct lruvec *lruvec;
  
@@ -10196,7 +10198,7 @@ index 0ceed77af0..8664a3431d 100644
  	if (lru_gen_enabled()) {
  		lru_gen_age_node(pgdat, sc);
  		return;
-@@ -7363,6 +7606,9 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
+@@ -7363,6 +7607,9 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
  void __meminit kswapd_run(int nid)
  {
  	pg_data_t *pgdat = NODE_DATA(nid);
@@ -10206,7 +10208,7 @@ index 0ceed77af0..8664a3431d 100644
  
  	pgdat_kswapd_lock(pgdat);
  	if (!pgdat->kswapd) {
-@@ -7374,7 +7620,32 @@ void __meminit kswapd_run(int nid)
+@@ -7374,7 +7621,32 @@ void __meminit kswapd_run(int nid)
  			BUG_ON(system_state < SYSTEM_RUNNING);
  			pgdat->kswapd = NULL;
  		}
@@ -10239,7 +10241,7 @@ index 0ceed77af0..8664a3431d 100644
  	pgdat_kswapd_unlock(pgdat);
  }
  
-@@ -7393,6 +7664,13 @@ void __meminit kswapd_stop(int nid)
+@@ -7393,6 +7665,13 @@ void __meminit kswapd_stop(int nid)
  		kthread_stop(kswapd);
  		pgdat->kswapd = NULL;
  	}
