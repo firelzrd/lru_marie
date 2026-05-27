@@ -182,15 +182,17 @@ Boot cmdline: `lru_marie=0` disables Marie at boot (equivalent to writing `0` to
 
 ## Recommended Configuration
 
-### The `vm.swappiness=1` Paradigm
+### The `vm.swappiness` Paradigm: Storage Speed Matters
 
-For desktop and general-purpose workloads, **`vm.swappiness=1` is the strongly recommended setting** when using Marie LRU.
+For desktop and general-purpose workloads on **modern hardware (NVMe/SSD and ZRAM)**, **`vm.swappiness=1` is the strongly recommended setting** when using Marie LRU.
 
-**The Philosophy:** Modern operating systems strive to keep physical RAM completely filled with file caches. When even slight memory pressure occurs, default settings (like `swappiness=60`) dictate that the kernel should begin swapping out anonymous pages. However, dropping a clean file page is instantaneous, whereas swapping out an anonymous page consumes significant CPU time and I/O bandwidth. With fast modern storage (NVMe/SSD), reading back a dropped file cache is incredibly "cheap". Thus, forcing the CPU to grind on swap-outs during normal daily usage just to load a new application is a severe waste of resources that degrades the user experience.
+**The Philosophy for Fast Storage:** Modern operating systems strive to keep physical RAM completely filled with file caches. When even slight memory pressure occurs, upstream Linux default settings (`swappiness=60`) dictate that the kernel should proportionally swap out anonymous pages. However, dropping a clean file page is instantaneous, whereas swapping out an anonymous page to ZRAM consumes significant CPU time, pollutes CPU caches with compression codecs, and blocks the calling context — causing visible UI stutter. With fast modern storage (NVMe/SSD), reading back a dropped file cache (refault) takes only microseconds and is virtually unnoticeable. Thus, forcing the system to grind on ZRAM swap-outs during normal daily usage just to preserve cold file caches is a severe waste of resources that degrades the user experience. **(Note: The Marie LRU patch automatically changes the kernel's default `vm.swappiness` from 60 to 1 for this exact reason).**
 
-**The Synergy:** In Legacy LRU or MGLRU, setting `swappiness=1` is dangerous; it often leads to severe thrashing and livelocks because the kernel will evict the entire file cache (including active working sets) before it starts swapping. Marie LRU completely solves this via the `clean_min_ratio` hard floor (inherited from `le9uo`). 
+**The Philosophy for Slow Storage:** If your system relies on **slower storage like HDDs**, the cost of reading back dropped file caches is high and causes severe unresponsiveness. In this case, **a higher `swappiness` value (e.g., the upstream default of 60)** is still recommended, meaning you should manually override Marie's default of 1. Marie LRU honors values from 2 to 199 by engaging its proportional controller, balancing the eviction between anon and file pages to minimize the severe I/O penalties of slow disks.
 
-By combining `vm.swappiness=1` with `clean_min_ratio=10` (the default), you achieve a robust synergy:
+**The Synergy (for `swappiness=1`):** In Legacy LRU or MGLRU, setting `swappiness=1` is dangerous; it often leads to severe thrashing and livelocks because the kernel will evict the entire file cache (including active working sets) before it starts swapping. Marie LRU completely solves this via the `clean_min_ratio` hard floor (inherited from `le9uo`). 
+
+By combining `vm.swappiness=1` with `clean_min_ratio=10` (the default), you achieve a robust synergy on modern systems:
 1. **During normal use**, the kernel exclusively drops "cheap" file caches. Zero CPU time is wasted on premature anonymous swap-outs.
 2. **Under severe pressure**, once the file cache drops to the `clean_min_ratio` floor, Marie securely locks the remaining file working set and forcibly diverts all reclaim pressure to anonymous pages (swap-out).
 
