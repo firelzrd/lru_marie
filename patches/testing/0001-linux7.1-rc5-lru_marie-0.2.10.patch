@@ -1,10 +1,10 @@
-From fa51f60ace7e95aa844859764cbe95cf94b86d14 Mon Sep 17 00:00:00 2001
+From e686e8890bb70fd62b6d5cbd67612d60c273eb93 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Tue, 2 Jun 2026 02:20:19 +0900
-Subject: [PATCH] linux7.1-rc5-lru_marie-0.2.9
+Date: Tue, 2 Jun 2026 15:05:36 +0900
+Subject: [PATCH] linux7.1-rc5-lru_marie-0.2.10
 
 ---
- include/linux/lru_marie.h      |  463 ++++++
+ include/linux/lru_marie.h      |  465 ++++++
  include/linux/mm_inline.h      |   67 +
  include/linux/mmzone.h         |   30 +
  include/linux/swap.h           |   18 +
@@ -15,7 +15,7 @@ Subject: [PATCH] linux7.1-rc5-lru_marie-0.2.9
  mm/lru_marie/Makefile          |   19 +
  mm/lru_marie/bitmap.c          |  166 ++
  mm/lru_marie/bitmap.h          |  228 +++
- mm/lru_marie/core.c            | 1802 +++++++++++++++++++++
+ mm/lru_marie/core.c            | 1809 +++++++++++++++++++++
  mm/lru_marie/prefetch.h        |  111 ++
  mm/lru_marie/simd.h            |   99 ++
  mm/lru_marie/simd_generic.c    |   46 +
@@ -23,10 +23,10 @@ Subject: [PATCH] linux7.1-rc5-lru_marie-0.2.9
  mm/lru_marie/simd_x86_avx2.S   |  214 +++
  mm/lru_marie/simd_x86_avx512.S |  199 +++
  mm/lru_marie/simd_x86_sse2.S   |  215 +++
- mm/lru_marie/state.c           | 2731 ++++++++++++++++++++++++++++++++
- mm/lru_marie/state.h           | 1296 +++++++++++++++
+ mm/lru_marie/state.c           | 2749 ++++++++++++++++++++++++++++++++
+ mm/lru_marie/state.h           | 1303 +++++++++++++++
  mm/lru_marie/version.h         |   22 +
- mm/lru_marie/walker.c          |  944 +++++++++++
+ mm/lru_marie/walker.c          |  949 +++++++++++
  mm/memcontrol-v1.c             |   13 +
  mm/memcontrol.c                |   35 +
  mm/mm_init.c                   |    3 +
@@ -36,7 +36,7 @@ Subject: [PATCH] linux7.1-rc5-lru_marie-0.2.9
  mm/swap.c                      |  102 ++
  mm/swap.h                      |    4 +
  mm/vmscan.c                    |  338 +++-
- 32 files changed, 9706 insertions(+), 7 deletions(-)
+ 32 files changed, 9745 insertions(+), 7 deletions(-)
  create mode 100644 include/linux/lru_marie.h
  create mode 100644 mm/lru_marie/Makefile
  create mode 100644 mm/lru_marie/bitmap.c
@@ -56,10 +56,10 @@ Subject: [PATCH] linux7.1-rc5-lru_marie-0.2.9
 
 diff --git a/include/linux/lru_marie.h b/include/linux/lru_marie.h
 new file mode 100644
-index 0000000000..4f0b932ceb
+index 0000000000..d3e7a27a7d
 --- /dev/null
 +++ b/include/linux/lru_marie.h
-@@ -0,0 +1,463 @@
+@@ -0,0 +1,465 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _LINUX_LRU_MARIE_H
 +#define _LINUX_LRU_MARIE_H
@@ -306,17 +306,19 @@ index 0000000000..4f0b932ceb
 + * @child_lv:  child memcg's lruvec (memcg being torn down)
 + * @parent_lv: parent memcg's lruvec (recipient)
 + *
-+ * Called from mm/swap.c::lru_reparent_memcg in lockstep with the legacy
-+ * list_splice that moves child's LRU lists into parent's. Without this
-+ * hook, Marie-tracked folios — which are NOT on the legacy LRU lists —
-+ * would be left orphaned on @child's gen lists while their objcg has
-+ * been reparented to @parent, producing stale list links that later
-+ * trigger use-after-free.
++ * NOTE: currently has NO in-tree caller. Marie handles memcg offline by
++ * draining (lru_marie_offline_memcg -> marie_drain_one_lruvec), not by
++ * reparenting. This is the reparent counterpart, kept for a future
++ * memcg-offline path that hands child folios to @parent instead of
++ * draining them.
 + *
-+ * Caller MUST hold both lruvecs' lru_lock and IRQs MUST be disabled.
-+ * lru_marie_reparent_lruvec acquires @child_mlv's per-type locks via the
-+ * marie_both_mlv guard internally; the merge itself is per-memcg
-+ * bitmap OR + atomic counter transfer, with no per-folio iteration.
++ * Lock contract for a future caller: it MUST hold both lruvecs' lru_lock
++ * with IRQs disabled, AND must acquire the two lru_locks in a
++ * deterministic global order (e.g. by lruvec address) so two concurrent
++ * reparents cannot deadlock A-B/B-A. This function itself only takes
++ * @child_mlv's per-type locks via the marie_both_mlv guard; the merge is
++ * a per-memcg bitmap OR + atomic counter transfer, with no per-folio
++ * iteration.
 + *
 + * Safe to call when lru_marie_enabled() is false or @child has no mlv yet —
 + * both cases short-circuit cleanly.
@@ -1343,10 +1345,10 @@ index 0000000000..1439771849
 +#endif	/* _MM_LRU_MARIE_BITMAP_H */
 diff --git a/mm/lru_marie/core.c b/mm/lru_marie/core.c
 new file mode 100644
-index 0000000000..55318cf50d
+index 0000000000..79864abbed
 --- /dev/null
 +++ b/mm/lru_marie/core.c
-@@ -0,0 +1,1802 @@
+@@ -0,0 +1,1809 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * mm/lru_marie/core.c — Marie LRU.
@@ -2034,6 +2036,14 @@ index 0000000000..55318cf50d
 +}
 +EXPORT_SYMBOL_GPL(lru_marie_offline_memcg);
 +
++/*
++ * NOTE: currently unused -- no in-tree caller. Marie's memcg offline path
++ * (lru_marie_offline_memcg) drains rather than reparents. Kept as the
++ * reparent counterpart for a future offline path. A future caller MUST
++ * hold both lruvecs' lru_lock (IRQs off) AND acquire them in a
++ * deterministic global order to avoid A-B/B-A between concurrent reparents;
++ * this function only takes @child_mlv's per-type locks (marie_both_mlv).
++ */
 +void lru_marie_reparent_lruvec(struct lruvec *child_lv, struct lruvec *parent_lv)
 +{
 +	struct marie_lruvec *child_mlv, *parent_mlv;
@@ -2046,10 +2056,9 @@ index 0000000000..55318cf50d
 +		return;
 +
 +	/*
-+	 * Best-effort parent_mlv materialisation. Caller holds both
-+	 * lruvecs' lru_lock with IRQs disabled (objcg_lock pinned by
-+	 * memcontrol.c::reparent_locks), so marie_get_lruvec falls back
-+	 * to GFP_ATOMIC. On allocation failure parent_mlv stays NULL and
++	 * Best-effort parent_mlv materialisation. A caller is required to
++	 * hold both lruvecs' lru_lock with IRQs disabled, so marie_get_lruvec
++	 * falls back to GFP_ATOMIC. On allocation failure parent_mlv stays NULL and
 +	 * reparent zeroes child's per-memcg bitmap without merging --
 +	 * folios then rely on global tracking only (no per-memcg filter).
 +	 */
@@ -4244,10 +4253,10 @@ index 0000000000..4646ca1b9c
 +SYM_FUNC_END(lru_marie_simd_scan_sse2)
 diff --git a/mm/lru_marie/state.c b/mm/lru_marie/state.c
 new file mode 100644
-index 0000000000..9b459a4906
+index 0000000000..82cb7335c5
 --- /dev/null
 +++ b/mm/lru_marie/state.c
-@@ -0,0 +1,2731 @@
+@@ -0,0 +1,2749 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Marie per-PFN state array — allocation, init, and global counters.
@@ -5953,6 +5962,7 @@ index 0000000000..9b459a4906
 +				long nr;
 +				int zone;
 +				enum lru_list inst_lru;
++				unsigned long flags;
 +
 +				pfn = folio_pfn(f);
 +				/*
@@ -6015,7 +6025,13 @@ index 0000000000..9b459a4906
 +							   target_tier);
 +				marie_memcg_bitmap_set(folio_memcg(f), pfn);
 +
-+				preempt_disable();
++				/*
++				 * IRQs off (not just preempt off): no lru_lock
++				 * here, and the counter/vmstat updates below must
++				 * be safe against same-CPU IRQ reentrancy. See the
++				 * rationale in marie_evict_counters_only.
++				 */
++				local_irq_save(flags);
 +				marie_pc_add(&marie_nr_folios, 1);
 +				marie_update_lru_size(lv, inst_lru, zone, nr);
 +				if (likely(mlv)) {
@@ -6027,7 +6043,7 @@ index 0000000000..9b459a4906
 +							[inst_lru][zone],
 +						nr);
 +				}
-+				preempt_enable();
++				local_irq_restore(flags);
 +
 +				if (!folio_put_testzero(f)) {
 +					/*
@@ -6064,7 +6080,7 @@ index 0000000000..9b459a4906
 +					 * marie_state_drop_pfn_at_free.
 +					 */
 +					folio_clear_active(f);
-+					preempt_disable();
++					local_irq_save(flags);
 +					marie_pc_add(&marie_nr_folios, -1);
 +					marie_update_lru_size(lv, inst_lru, zone, -nr);
 +					if (likely(mlv)) {
@@ -6076,7 +6092,7 @@ index 0000000000..9b459a4906
 +								[inst_lru][zone],
 +							-nr);
 +					}
-+					preempt_enable();
++					local_irq_restore(flags);
 +					__folio_put(f);
 +				}
 +			}
@@ -6435,6 +6451,7 @@ index 0000000000..9b459a4906
 +	int type, zone;
 +	long nr;
 +	enum lru_list del_lru;
++	unsigned long flags;
 +
 +	if (unlikely(!list_empty(&folio->lru))) {
 +		/*
@@ -6455,7 +6472,17 @@ index 0000000000..9b459a4906
 +	zone = folio_zonenum(folio);
 +	nr = folio_nr_pages(folio);
 +
-+	preempt_disable();
++	/*
++	 * IRQs off, not merely preempt off: this isolate path runs WITHOUT
++	 * lru_lock. Both marie_pc_add (the global marie_nr_folios counter) and
++	 * the __mod_zone_page_state inside marie_update_lru_size are only safe
++	 * against same-CPU IRQ/softirq reentrancy with IRQs disabled. A softirq
++	 * folio_put -> __page_cache_release -> lru_marie_del_folio touching the
++	 * same counter/vmstat would otherwise self-deadlock on fbc->lock or
++	 * corrupt the per-CPU vmstat diff mid-RMW. preempt_disable alone does
++	 * not close that window.
++	 */
++	local_irq_save(flags);
 +
 +	if (folio_test_active(folio))
 +		folio_clear_active(folio);
@@ -6515,7 +6542,7 @@ index 0000000000..9b459a4906
 +	/* Clear memcg bitmap now (folio gone before post-reclaim drop runs). */
 +	marie_memcg_bitmap_clear(folio_memcg(folio), folio_pfn(folio));
 +
-+	preempt_enable();
++	local_irq_restore(flags);
 +}
 +
 +/*
@@ -6981,10 +7008,10 @@ index 0000000000..9b459a4906
 +}
 diff --git a/mm/lru_marie/state.h b/mm/lru_marie/state.h
 new file mode 100644
-index 0000000000..8c1b066894
+index 0000000000..92eb850b53
 --- /dev/null
 +++ b/mm/lru_marie/state.h
-@@ -0,0 +1,1296 @@
+@@ -0,0 +1,1303 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _MM_LRU_MARIE_STATE_H
 +#define _MM_LRU_MARIE_STATE_H
@@ -7736,41 +7763,48 @@ index 0000000000..8c1b066894
 +
 +/*
 + * marie_pc_add - Marie-private percpu_counter add that elides the
-+ * standard preempt_disable / preempt_enable bracket.
++ * outer preempt_disable / preempt_enable bracket of
++ * percpu_counter_add_batch() while preserving its IRQ safety.
 + *
-+ * percpu_counter_add_batch() disables preempt internally to protect
-+ * the per-CPU diff's read-modify-write against task migration. Every
-+ * Marie caller of this routine -- install_local, install_locked,
-+ * install_at_gen, evict_locked, reparent_locked, the lru_marie_del_folio
-+ * dispatcher, lru_marie_split_folio, plus the fill / drain paths --
-+ * already holds lruvec->lru_lock via spin_lock_irqsave (or a stricter
-+ * outer lock), which has both preempt AND IRQ disabled for the entire
-+ * critical section. The extra preempt_disable inside percpu_counter
-+ * is therefore pure overhead. Under 16-thread memhog it shows up in
-+ * perf as ~4 % of total CPU spent in preempt_count_add +
-+ * check_preemption_disabled. Use the underlying primitives directly.
++ * percpu_counter_add_batch() wraps the whole body in
++ * preempt_disable/enable. Under DEBUG_PREEMPT that bracket shows up in
++ * perf under 16-thread memhog as ~4 % of total CPU (preempt_count_add +
++ * check_preemption_disabled). We drop it because the individual
++ * this_cpu_* primitives used here are each self-contained: this_cpu_add
++ * is a single atomic RMW (one instruction on x86), and the slow-path
++ * fbc->lock section takes raw_spin_lock_irqsave, so correctness does
++ * not depend on the caller's preempt or IRQ state.
 + *
-+ * Lock contract: caller MUST be in preempt-off context (typically via
-+ * spin_lock_irqsave on lru_lock). DEBUG_PREEMPT builds enforce this
-+ * via __this_cpu_*'s built-in check.
++ * IRQ safety is MANDATORY, not optional: not every caller holds
++ * lru_lock. The reclaim isolate path (marie_evict_counters_only) and
++ * the survivor putback in marie_state_shrink_lruvec update the GLOBAL
++ * marie_nr_folios counter with IRQs ENABLED (preempt_disable only).
++ * The same counter is also bumped from IRQ/softirq context when a
++ * Marie-tracked LRU folio's last reference is dropped
++ * (folio_put -> __page_cache_release -> lruvec_del_folio ->
++ * lru_marie_del_folio -> marie_evict_locked). If the flush path used a
++ * plain raw_spin_lock, a softirq landing on the CPU that already holds
++ * fbc->lock would spin forever on it -> hard lockup. Hence
++ * raw_spin_lock_irqsave below, exactly as percpu_counter_add_batch does.
 + *
-+ * Flush-path lock: the original percpu_counter_add_batch uses
-+ * raw_spin_lock_irqsave on fbc->lock when the per-CPU diff exceeds
-+ * the batch threshold. Since IRQs are already disabled here we drop
-+ * to plain raw_spin_lock -- one fewer FLAGS load/store per flush.
++ * The fast path uses this_cpu_add (atomic against same-CPU IRQ
++ * reentrancy); the earlier __this_cpu_read + __this_cpu_write pair was
++ * a non-atomic RMW that could lose an IRQ-context update.
 + */
 +static inline void marie_pc_add(struct percpu_counter *fbc, s64 amount)
 +{
-+	s64 count;
++	s64 count = this_cpu_read(*fbc->counters) + amount;
 +
-+	count = __this_cpu_read(*fbc->counters) + amount;
 +	if (unlikely(abs(count) >= percpu_counter_batch)) {
-+		raw_spin_lock(&fbc->lock);
++		unsigned long flags;
++
++		raw_spin_lock_irqsave(&fbc->lock, flags);
++		count = __this_cpu_read(*fbc->counters) + amount;
 +		fbc->count += count;
 +		__this_cpu_sub(*fbc->counters, count - amount);
-+		raw_spin_unlock(&fbc->lock);
++		raw_spin_unlock_irqrestore(&fbc->lock, flags);
 +	} else {
-+		__this_cpu_write(*fbc->counters, count);
++		this_cpu_add(*fbc->counters, amount);
 +	}
 +}
 +
@@ -8283,7 +8317,7 @@ index 0000000000..8c1b066894
 +#endif /* _MM_LRU_MARIE_STATE_H */
 diff --git a/mm/lru_marie/version.h b/mm/lru_marie/version.h
 new file mode 100644
-index 0000000000..43f899b0e0
+index 0000000000..c136c4ab5b
 --- /dev/null
 +++ b/mm/lru_marie/version.h
 @@ -0,0 +1,22 @@
@@ -8306,15 +8340,15 @@ index 0000000000..43f899b0e0
 +#define MARIE_PROGNAME	"Marie LRU"
 +#define MARIE_AUTHOR	"Masahito Suzuki"
 +
-+#define MARIE_VERSION	"0.2.9"
++#define MARIE_VERSION	"0.2.10"
 +
 +#endif /* _MM_LRU_MARIE_VERSION_H */
 diff --git a/mm/lru_marie/walker.c b/mm/lru_marie/walker.c
 new file mode 100644
-index 0000000000..0942b780ff
+index 0000000000..94eaa63ae6
 --- /dev/null
 +++ b/mm/lru_marie/walker.c
-@@ -0,0 +1,944 @@
+@@ -0,0 +1,949 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * mm/lru_marie/walker.c — Marie's SIMD-accelerated PTE walker.
@@ -8824,15 +8858,20 @@ index 0000000000..0942b780ff
 + * pass-end promote drain.
 + *
 + * Lock contract:
-+ *   per-PMD: holds the existing pte_offset_map_lock ptl
-+ *   walker_visits bump: under per-type lock (scoped_guard
-+ *                       marie_type_lock) inside the pgdat-wide pass
++ *   per-PMD:         holds the existing pte_offset_map_lock ptl
++ *   per-PTE body:    lock-free -- marie_state_inc_tier mutates only the
++ *                    per-PFN state byte
++ *   walker_visits:   lock-free atomic_inc on the global
++ *                    marie_gen_walker_visits[gen][type] counter (read as a
++ *                    >= 1 boolean; reset in marie_try_advance_head)
++ *   bloom rotation:  per-pgdat marie_blooms[nid].lock (irqsave), taken only
++ *                    for lazy alloc / pass-end swap
 + *   per-pgdat deadline: cmpxchg on marie_walker_next[nid]
 + *
-+ * Lock ordering: walker takes pte ptl (via pte_offset_map_lock); the
-+ * inner per-PTE body never takes any Marie lock (marie_state_inc_tier
-+ * runs lock-free on the per-PFN byte). The pass-end housekeeping
-+ * takes lru_lock outer, per-type lock inner.
++ * Lock ordering: the walker takes the pte ptl and, under it, at most the
++ * per-pgdat bloom lock (a leaf). It takes NO lru_lock and NO per-type
++ * lock anywhere, so it does not participate in -- and cannot invert --
++ * Marie's lru_lock -> type_lock hierarchy.
 + */
 +
 +/*
