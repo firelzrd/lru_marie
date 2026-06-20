@@ -2,9 +2,11 @@
 
 **Multi-graded Adaptive Reclaim & Independent Eviction**
 
-Marie is an out-of-tree, third-pillar LRU implementation for the Linux kernel, sitting alongside Legacy LRU and MGLRU rather than replacing either.  It composes three established ideas — working-set protection ([le9uo](https://github.com/firelzrd/le9uo)), proportional anon/file aging under a generational ring ([Re-swappiness](https://github.com/firelzrd/re-swappiness)), and async swap-out offload ([kcompressd-unofficial](https://github.com/firelzrd/kcompressd-unofficial)) — onto a redesigned core: per-lruvec lock-free pending queues, a bounded generation ring without forced oldest-gen drain, and a SIMD-accelerated PTE walker driven by rmap-to-walker bloom-filter feedback.
+Marie is an out-of-tree, third-pillar LRU implementation for the Linux kernel, sitting alongside Legacy LRU and MGLRU rather than replacing either.  It composes three established ideas — working-set protection ([le9uo](https://github.com/firelzrd/le9uo)), proportional anon/file aging under a generational ring ([Re-swappiness](https://github.com/firelzrd/re-swappiness)), and async swap-out offload ([kcompressd-unofficial](https://github.com/firelzrd/kcompressd-unofficial)) — onto a redesigned core: a flat per-PFN state array with no linked lists or staging queues, a single global generation ring per memory type without forced oldest-gen drain, and a SIMD-accelerated PTE walker driven by rmap-to-walker bloom-filter feedback.
 
-Marie's paths are gated behind a runtime static key (`lru_marie_enabled()`), so a kernel built with `CONFIG_LRU_MARIE=y` but Marie turned off behaves exactly as MGLRU / Legacy LRU would.
+Marie is **desktop / global-only**: it runs a single node-global aging clock and reclaim scan and keeps *zero* per-memcg/per-lruvec reclaim state. cgroup *charging* (`memory.current`, PSI) stays on the stock path, but cgroup memory limits are not enforced through Marie's reclaim. This trades multi-tenant isolation — irrelevant on a single-user desktop, where Marie's near-OOM stability subsumes the stability purpose of cgroup limits and `oom_score_adj` covers OOM targeting — for a dramatically simpler, more robust core. (It is therefore unsuited to containers/servers/Android that depend on per-cgroup reclaim isolation.)
+
+Marie is selected once at boot behind a static key (`lru_marie_enabled()`), so a kernel built with `CONFIG_LRU_MARIE=y` but booted with `lru_marie=0` behaves exactly as MGLRU / Legacy LRU would. There is no runtime on/off toggle — the key is set before any folio is tracked, so the `enabled` sysfs node is read-only.
 
 ---
 
@@ -22,12 +24,13 @@ Legend — ✅ behaves as expected · ⚠️ works but with a structural trade-o
 
 | Aspect                | Legacy LRU                                                                | MGLRU                                                                                                       | Marie                                                                                                       |
 | :-------------------- | :------------------------------------------------------------------------ | :---------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------- |
-| Aging granularity     | ⚠️ binary active / inactive only                                           | ✅ 4-gen ring (`MAX_NR_GENS=4`); a full ring triggers a forced `inc_min_seq` oldest-gen drain                 | ✅ 4-gen ring (`MARIE_MAX_NR_GENS=4`); advance skips when the ring is full, no forced drain                  |
+| Aging granularity     | ⚠️ binary active / inactive only                                           | ✅ 4-gen ring (`MAX_NR_GENS=4`); a full ring triggers a forced `inc_min_seq` oldest-gen drain                 | ✅ 4-gen ring (`MARIE_PFN_NR_GENS=4`); advance skips when the ring is full, no forced drain                  |
 | anon/file iteration   | ✅ per-type lists; `vm.swappiness` works as a proportional anon:file ratio | ❌ shared `max_seq` across anon/file reduces `vm.swappiness` to a per-generation hint                        | ✅ per-type `seq` / `min_seq` / ring; restores `vm.swappiness` as a proportional ratio                       |
 | Hot-signal harvest    | ⚠️ rmap-driven `PG_referenced` only; no active walker                      | ✅ PTE walker + walker-internal PMD bloom filter + rmap look-around cascading `PG_referenced`                | ✅ Vectorized PTE walker + rmap-fed PMD bloom filter + rmap look-around updating a saturating tier bit only            |
 | Compression stall     | ❌ kswapd blocks inside `zswap_store`                                      | ❌ kswapd blocks inside `zswap_store`                                                                        | ✅ offloaded to per-node `kcompmari` kthread                                                                 |
 | Clean-file floor      | ❌ none                                                                    | ❌ none                                                                                                      | ✅ `clean_min_ratio` hard floor against thrashing                                                            |
 | Reclaim-livelock OOM  | ❌ retries until `MAX_RECLAIM_RETRIES`                                     | ❌ retries until `MAX_RECLAIM_RETRIES`                                                                       | ✅ `clean_min_ratio` floor enforced on every reclaim path → reclaim stops cleanly at the floor and the stock no-progress OOM fires promptly; plus a swap-write-failure fast-path |
+| cgroup reclaim / isolation | ✅ per-memcg active/inactive lists; `memory.max` enforced via targeted reclaim | ✅ per-memcg gen state; `memory.max` enforced via targeted reclaim | ❌ desktop/global-only — single node-global scan, no per-cgroup reclaim isolation (`memory.max` not enforced through Marie; cgroup *charging* / `memory.current` / PSI stay accurate) |
 
 These are deliberate choices on MGLRU's side: fewer state bits per folio, fewer fast-path branches, a single iteration counter shared between memory types, a self-contained walker that owns its own feedback.  Marie's complementary design accepts the resulting state cost in exchange for proportional `vm.swappiness` control under a generational ring, hard working-set protection, and a hot-signal pipeline that pulls the rmap into the loop instead of letting it cascade `PG_referenced` onto neighbouring folios.
 
@@ -46,9 +49,9 @@ These are deliberate choices on MGLRU's side: fewer state bits per folio, fewer 
                        Marie LRU
                           │
                   (own pipeline core:
-                   residency ADT,
-                   bounded gen ring w/o
-                   forced inc_min_seq,
+                   flat per-PFN state array,
+                   global per-type gen ring
+                   w/o forced oldest-gen drain,
                    SIMD PTE walker,
                    rmap-fed bloom)
 ```
@@ -56,8 +59,8 @@ These are deliberate choices on MGLRU's side: fewer state bits per folio, fewer 
 Marie keeps the **goals** of its predecessors but doesn't reuse their implementations verbatim — it re-derives each idea inside its own LRU core so the surrounding state (gen ring, lock topology, scan order) is internally consistent.
 
 - From **le9uo**: hard working-set protection (`clean_min_ratio`).  Like le9uo, Marie enforces the floor on the single path that actually reclaims and then lets the kernel's stock no-progress OOM path fire — once clean file is at the floor and anon is unreclaimable, reclaim returns no progress and the OOM killer fires promptly, with no separate early-OOM watermark needed (this is why le9uo converges at any floor size).  `anon_min_ratio` and `clean_low_ratio` from le9uo are intentionally **not** ported — under Marie the former is largely redundant with `vm.swappiness` once `kcompmari` brings anon refault sub-millisecond, and the latter overlaps with the existing `swap_tokens` bucket.
-- From **Re-swappiness**: per-type `seq` / `min_seq` so `vm.swappiness` acts as a proportional anon:file scan ratio under a generational ring (the property Legacy LRU already has and MGLRU loses by sharing `max_seq`).  Re-swappiness ports this onto MGLRU's structure; Marie owns its own per-type state inside `marie_lruvec` and does not depend on MGLRU being per-type.
-- From **kcompressd-unofficial**: per-node async compression FIFO so kswapd doesn't block in `zswap_store` / `__swap_writepage`.  Marie carries this over as `kcompmari` (renamed from `kcompressd` for Marie's namespace) with the same per-node FIFO design and the same 0–256 depth knob, default 24.
+- From **Re-swappiness**: per-type aging so `vm.swappiness` acts as a proportional anon:file scan ratio under a generational ring (the property Legacy LRU already has and MGLRU loses by sharing `max_seq`).  Re-swappiness ports this onto MGLRU's structure; Marie owns its own per-type aging in node-global per-type statics (`marie_head_gen[type]` plus independent per-type gen rings) and does not depend on MGLRU being per-type.
+- From **kcompressd-unofficial**: per-node async compression FIFO so kswapd doesn't block in `zswap_store` / `__swap_writepage`.  Marie carries this over as `kcompmari` (renamed from `kcompressd` for Marie's namespace) with the same per-node FIFO design and a signed −100..+100 depth knob, default +24.
 
 ---
 
@@ -79,7 +82,7 @@ Marie keeps the **goals** of its predecessors but doesn't reuse their implementa
            ▼            ▼           ▼
    ┌────────────────────────────────────────┐
    │        L1 / L2 tracking bitmaps        │
-   │  global (type, gen, tier) + per-memcg  │
+   │   single global (type, gen, tier)      │
    └────────────────────┬───────────────────┘
                         │
                         ▼ (L2-pruned __ffs/blsr isolate)
@@ -98,7 +101,7 @@ Marie keeps the **goals** of its predecessors but doesn't reuse their implementa
 ```
 
 - **Flat per-PFN state array (`marie_state`)**: Marie abandons linked lists entirely. Every folio's state is encoded in a single byte (TRACKED, TYPE, ZONE, GEN, TIER) within a flat array allocated once at boot. This eliminates allocation in the fast paths and per-CPU staging queues.
-- **L1/L2 tracking bitmaps**: To efficiently scan the flat array, Marie maintains 512-bit summarized L2 bitmaps for both global (type, gen, tier) combinations and per-memcg accounting, allowing the isolate scanner to skip empty 32 MiB ranges in a single cycle.
+- **L1/L2 tracking bitmaps**: To efficiently scan the flat array, Marie maintains 512-bit summarized L2 bitmaps for each global (type, gen, tier) combination, allowing the isolate scanner to skip empty 32 MiB ranges in a single cycle.
 - **Independent per-type rings**: Aging is tracked by `marie_head_gen[type]` cycling counters. Anon and file have fully independent rings, restoring `vm.swappiness` as a proportional scan ratio without forcing oldest-gen drains.
 - Hot-signal pickup is split across rmap and the walker. MGLRU also uses a bloom filter, but it's walker-internal — a self-feedback to skip PMDs that the walker itself did not touch on the previous pass. Marie's bloom is cross-component: rmap is the producer (the PTL-bounded look-around flags PMDs that just took a young hit), the walker is the consumer (it pays the SIMD scan + tier++ cost only on bloom-hit PMDs). This lets a hot signal observed by rmap influence the walker within the same reclaim window, not the next one.
 
@@ -117,7 +120,7 @@ Marie tracks a folio's lifecycle entirely via a single byte per PFN in `marie_st
 - **2 bits TIER**: saturating hotness counter (0..3), bumped by the walker or rmap.
 
 Because state is purely array-based, there are no `list_del` or `swap-pop` operations during eviction or installation. `marie_state[pfn] = 0` instantly drops tracking. To isolate folios, Marie uses an **L2-pruned `__ffs`/`blsr` walk** combined with **Two-Stage Software Prefetching**:
-- **L2-pruning**: Bitwise ANDing the global (gen, tier) L2 bitmap with the memcg's L2 bitmap skips empty 32 MiB chunks in 1 CPU cycle.
+- **L2-pruning**: Scanning the global (type, gen, tier) L2 bitmap for the target bucket skips empty 32 MiB chunks in 1 CPU cycle.
 - **Hardware Extraction**: Surviving L2 blocks are resolved to precise PFNs in near O(1) time using `__ffs` (Find First Set) and `blsr` (reset lowest set bit) hardware instructions over the L1 bitmap.
 - **Strategic Prefetch**: A "Cache-line cursor" tracks boundaries to issue exactly one prefetch per cache-line. It fires `prefetcht2` (DRAM → L3) far ahead of the processing cursor, and `prefetcht0` (L3 → L1) slightly ahead, hiding the DRAM latency wall without thrashing the L1 cache.
 
@@ -125,7 +128,7 @@ Because state is purely array-based, there are no `list_del` or `swap-pop` opera
 
 MGLRU's ring has `MAX_NR_GENS=4`.  When it fills, aging calls `try_to_inc_min_seq()` to push the oldest gen forward before cutting a new head.  If that oldest gen holds folios that won't move — clean file pages under a working-set policy, mlocked anon, etc. — aging still demands forward progress, so the same untouchable folios get rewalked over and over: the *forced `inc_min_seq` treadmill*.
 
-Marie uses a 4-gen cap (`MARIE_MAX_NR_GENS=4`) tracked by `marie_head_gen[type]`. Head-generation advance is *drain-wait gated*: `marie_try_advance_head()` will not advance if the next slot in the ring still contains folios.
+Marie uses a 4-gen cap (`MARIE_PFN_NR_GENS=4`) tracked by `marie_head_gen[type]`. Head-generation advance is *drain-wait gated*: `marie_try_advance_head()` will not advance if the next slot in the ring still contains folios.
 
 Practical effect: an oldest gen full of `clean_min_ratio`-protected folios is left alone.  Aging stops growing new heads until reclaim drains the existing tail (or `clean_min_ratio` diverts the type selector to anon).  The treadmill never starts because nothing in Marie demands aging-side progress regardless of consumer state.
 
@@ -153,30 +156,30 @@ Marie keeps **fully independent** per-type state — each of ANON and FILE has i
 
 ### Coexistence
 
-- **Static-key gate.**  Every Marie entry point is fronted by `lru_marie_enabled()`, a `DEFINE_STATIC_KEY_TRUE`. When Marie is runtime-disabled the branch is patched out, so MGLRU / Legacy users see zero added instructions on the hot paths.
-- **No folio->flags footprint.** Unlike 0.1.0, Marie 0.2.0 no longer reserves bits in `folio->flags`. All tracking state resides entirely inside the `marie_state` array, making its memory layout completely independent of core MM flags.
+- **Static-key gate.**  Every Marie entry point is fronted by `lru_marie_enabled()`, a `DEFINE_STATIC_KEY_TRUE` selected once at boot. When Marie is disabled (`lru_marie=0`) the branch is patched out, so MGLRU / Legacy users see zero added instructions on the hot paths. There is no runtime on/off transition: the key is set before any folio is tracked, so there is no drain/fill machinery and no `transition_sem`-style serialisation on the reclaim path.
+- **No folio->flags footprint.** Marie reserves no bits in `folio->flags`. All tracking state resides entirely inside the `marie_state` array, making its memory layout completely independent of core MM flags.
 
 ---
 
 ## Tunables
 
-All knobs live under `/sys/kernel/mm/lru_marie/` and accept runtime writes (except for the read-only `version` and `stats` nodes).
+All knobs live under `/sys/kernel/mm/lru_marie/`. Most accept runtime writes; `enabled`, `version` and `stats` are read-only (`enabled` reflects the boot-time selection — see `lru_marie=` below).
 
 | Knob                          | Default       | Range / unit                | What it does                                                                                                 |
 | :---------------------------- | :------------ | :-------------------------- | :----------------------------------------------------------------------------------------------------------- |
-| `enabled`                     | `1`           | 0 / 1, static key           | Master gate.  `0` patches Marie out of the hot paths; MGLRU / Legacy take over.                              |
+| `enabled`                     | `1`           | read-only (boot static key) | Master gate, selected at boot via `lru_marie=`. Read-only at runtime; `0` means Marie was patched out of the hot paths and MGLRU / Legacy took over. |
 | `simd`                        | `1`           | 0 / 1, static key           | Toggles SIMD young-bit scan.  `0` falls back to scalar (A/B testing).                                        |
 | `version`                     | —             | read-only                   | Reports the current Marie LRU version.                                                                       |
 | `stats`                       | —             | read-only                   | Exposes internal reclaim and walker statistics.                                                              |
 | `clean_min_ratio`             | `10`          | 0–100, %RAM                 | Hard floor on clean file pages.  Below this, reclaim diverts to anon instead of evicting file.               |
 | `kcompmari`                   | `24`          | -100..+100                  | Async swap queue depth. `0` disables. Positive = Marie-gated; negative = force-enable regardless of Marie. |
-| `gen_growth_threshold`        | `8192`        | folios (`SWAP_CLUSTER_MAX << 8`) | Head-generation growth limit before a new gen is cut.                                                   |
+| `gen_growth_threshold`        | `65536`       | folios (`SWAP_CLUSTER_MAX << 11`) | Head-generation growth limit before a new gen is cut.                                                  |
 | `walker_interval_critical_ms` | `HZ/30` (~33 ms) | ms                       | Walker cadence under critical memory pressure.                                                               |
 | `walker_interval_low_ms`      | `HZ/10` (100 ms) | ms                        | Walker cadence under low pressure.                                                                           |
 | `walker_interval_normal_ms`   | `HZ/4` (250 ms) | ms                         | Walker cadence under normal pressure.                                                                        |
 | `walker_interval_idle_ms`     | `HZ` (1000 ms)  | ms                         | Walker cadence when idle.                                                                                    |
 
-Boot cmdline: `lru_marie=0` disables Marie at boot (equivalent to writing `0` to `enabled` immediately after boot).
+Boot cmdline: `lru_marie=0` disables Marie at boot (and `lru_marie=1` forces it on). This is the only way to select Marie vs MGLRU / Legacy — the choice is latched into the static key before any folio is tracked, so the `enabled` node cannot be flipped at runtime.
 
 ---
 
@@ -217,13 +220,13 @@ make olddefconfig    # answer Y to CONFIG_LRU_MARIE
 make -j$(nproc)
 ```
 
-`CONFIG_LRU_MARIE` defaults to `y` (Marie depends on `CONFIG_MMU`). `CONFIG_LRU_GEN` and `CONFIG_LRU_GEN_ENABLED` should stay as they were — Marie does not replace MGLRU at build time, only at runtime.
+`CONFIG_LRU_MARIE` defaults to `y` (Marie depends on `CONFIG_MMU`). `CONFIG_LRU_GEN` and `CONFIG_LRU_GEN_ENABLED` should stay as they were — Marie does not replace MGLRU at build time, only displaces it at boot (via the `lru_marie=` static key) when enabled.
 
 To verify Marie is active after boot:
 
 ```
 cat /sys/kernel/mm/lru_marie/enabled       # 1 = active
-cat /sys/kernel/mm/lru_marie/version       # e.g., 0.2.0
+cat /sys/kernel/mm/lru_marie/version       # e.g., 0.5.0
 ```
 
 ---
@@ -237,7 +240,13 @@ cat /sys/kernel/mm/lru_marie/version       # e.g., 0.2.0
 | ARM64                     | ⚠️ scalar only    | NEON walker pending FPU save/restore profiling vs. the scalar baseline                                               |
 | Other arches              | ⚠️ scalar only    | functional, no SIMD acceleration                                                                                     |
 
-Known kernel bases with Marie 0.2.0 patches in this repo: 6.12.74, 6.18.22, 7.0, 7.1-rc1.  All four ports share the same Marie source tree (`mm/lru_marie*.c/.h`, `include/linux/lru_marie*.h`) — the patches differ only in base-kernel-side adaptations.  In particular, the batched no-flush young-PTE API used by Marie's walker is native on 7.1-rc1 (`test_and_clear_young_ptes` / `test_and_clear_young_ptes_notify`), absent on 7.0 (the 7.0 patch back-ports it into `include/linux/pgtable.h` and `include/linux/mmu_notifier.h`), and absent on 6.18 and 6.12 (the 6.18 and 6.12 patches back-port the same API plus thin `lazy_mmu_mode_enable/disable` wrappers, since they only have `arch_enter_lazy_mmu_mode` and lack the 7.0 reentrancy-tracking helpers).
+Known kernel bases with Marie 0.5.0 patches in this repo: 6.12.74, 6.18.22, 7.0, 7.1-rc5.  All four ports share a byte-identical Marie core (the `mm/lru_marie/` directory and `include/linux/lru_marie.h`); the few in-tree mm APIs that changed signature across these kernels are isolated behind uniform names in `mm/lru_marie/compat.h`, switched by `LINUX_VERSION_CODE`, so producing a per-version port only re-touches that one header plus the unavoidable context of the integration hunks. Those deltas are:
+
+- `folio->flags` became the typed `memdesc_flags_t` (`struct { unsigned long f; }`) in **6.18**; `shrink_folio_list()` gained a `memcg` parameter and `folio_pte_batch()` was replaced by `folio_pte_batch_flags()` in **6.18**;
+- `arch_enter/leave_lazy_mmu_mode()` were renamed to `lazy_mmu_mode_enable/disable()` in **7.0** (compat.h provides the new names on 6.12 / 6.18);
+- the batched no-flush young-PTE API `test_and_clear_young_ptes_notify()` is native on **7.1** (compat.h emulates it as a per-PTE `ptep_clear_young_notify()` loop on 6.12 / 6.18 / 7.0).
+
+Because Marie 0.5.0 is desktop/global-only, it carries no per-memcg lifecycle hooks, which removes the largest source of cross-version churn (notably the 7.1 objcg-reparent handling that earlier per-memcg revisions needed).
 
 ---
 
