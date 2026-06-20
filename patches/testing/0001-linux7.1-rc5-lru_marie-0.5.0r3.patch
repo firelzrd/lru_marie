@@ -1,7 +1,7 @@
-From 7377b55783595a77cafbc1f4da08d9eae6c1a440 Mon Sep 17 00:00:00 2001
+From afcdccb9274a7ae97ec2d1f6f966fe17f7e94fd3 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sat, 20 Jun 2026 11:03:50 +0900
-Subject: [PATCH] linux7.1-rc5-lru_marie-0.5.0r2
+Date: Sun, 21 Jun 2026 08:49:37 +0900
+Subject: [PATCH] linux7.1-rc5-lru_marie-0.5.0r3
 
 ---
  include/linux/lru_marie.h      |  441 ++++++
@@ -32,7 +32,7 @@ Subject: [PATCH] linux7.1-rc5-lru_marie-0.5.0r2
  mm/lru_marie/version.h         |   22 +
  mm/lru_marie/walker.c          |  917 +++++++++++
  mm/memcontrol-v1.c             |   11 +
- mm/memcontrol.c                |   13 +
+ mm/memcontrol.c                |   21 +
  mm/mm_init.c                   |    3 +
  mm/page_alloc.c                |   76 +
  mm/page_io.c                   |  187 +++
@@ -40,7 +40,7 @@ Subject: [PATCH] linux7.1-rc5-lru_marie-0.5.0r2
  mm/swap.c                      |  248 ++-
  mm/swap.h                      |    4 +
  mm/vmscan.c                    |  347 +++-
- 36 files changed, 8907 insertions(+), 23 deletions(-)
+ 36 files changed, 8915 insertions(+), 23 deletions(-)
  create mode 100644 include/linux/lru_marie.h
  create mode 100644 mm/lru_marie/Makefile
  create mode 100644 mm/lru_marie/account.h
@@ -8436,7 +8436,7 @@ index 433bba9dfe..a7923ef2fa 100644
  }
  
 diff --git a/mm/memcontrol.c b/mm/memcontrol.c
-index 749c128b4f..6f948ca985 100644
+index 749c128b4f..12756d8863 100644
 --- a/mm/memcontrol.c
 +++ b/mm/memcontrol.c
 @@ -28,6 +28,7 @@
@@ -8447,7 +8447,7 @@ index 749c128b4f..6f948ca985 100644
  #include <linux/cgroup.h>
  #include <linux/cpuset.h>
  #include <linux/sched/mm.h>
-@@ -5178,6 +5179,18 @@ static void uncharge_folio(struct folio *folio, struct uncharge_gather *ug)
+@@ -5178,6 +5179,26 @@ static void uncharge_folio(struct folio *folio, struct uncharge_gather *ug)
  			ug->nr_memory += nr_pages;
  		ug->pgpgout++;
  
@@ -8459,8 +8459,16 @@ index 749c128b4f..6f948ca985 100644
 +		 * page-free hook that follows runs after memcg_data is zeroed
 +		 * and cannot resolve the lruvec. No-op for the common case (bit
 +		 * already retired by the normal evict path).
++		 *
++		 * 7.1: uncharge_folio is objcg-only (no memcg local). Resolve
++		 * the owning memcg from the pinned objcg under RCU --
++		 * obj_cgroup_memcg() requires it (objcg->memcg may be swapped to
++		 * the parent at reparent), and the read section keeps the
++		 * resolved memcg alive across the backstop's lruvec debit.
 +		 */
-+		lru_marie_uncharge_backstop(folio, memcg);
++		rcu_read_lock();
++		lru_marie_uncharge_backstop(folio, obj_cgroup_memcg(objcg));
++		rcu_read_unlock();
 +#endif
 +
  		WARN_ON_ONCE(folio_unqueue_deferred_split(folio));
