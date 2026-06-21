@@ -138,8 +138,8 @@ Marie keeps **fully independent** per-type state — each of ANON and FILE has i
 
 ### Hot-signal harvest
 
-- **SIMD PTE walker** (per-pgdat).  On x86-64, `arch_initcall` picks the widest available SIMD instruction set (AVX-512F > AVX2 > SSE2) and flips a static branch so the walker's young-bit extraction has no indirect call. The walker uses SIMD to read 512 64-bit PTEs at once and extract their Accessed bits via vector masks, entirely avoiding per-PTE branching. ARM64 and other arches use a scalar fallback for now.
-- **FPU batching**.  `kernel_fpu_begin/end` are amortised across `MARIE_FPU_BATCH=16` consecutive bloom-hit PMDs, then released around the `walk_page_range` boundary so the preempt-disabled window stays bounded by `MARIE_FPU_BATCH`, not by walk length.
+- **SIMD PTE walker** (per-pgdat).  On x86-64, `arch_initcall` picks the widest available SIMD instruction set (AVX-512F > AVX2 > SSE2) — capped by the `simd_max` knob — and flips a static branch so the walker's young-bit extraction has no indirect call. Each scan reads 512 64-bit PTEs at once and reduces them to a 512-bit young-bit mask via vector ops, entirely avoiding per-PTE branching. Both `simd` (on/off) and `simd_max` (ISA cap) are runtime-tunable and boot-seedable. ARM64 and other arches use a scalar fallback for now.
+- **FPU batching**.  `kernel_fpu_begin/end` are amortised across `fpu_batch` consecutive bloom-hit PMDs (default 4), then released around the `walk_page_range` boundary so the window stays bounded by `fpu_batch`, not by walk length. The bracket disables preemption on x86, so the small default keeps the preempt-disabled window short on few-core machines under sustained reclaim; it is runtime-tunable and boot-seedable.
 - **rmap look-around**.  Called from `folio_referenced_one()`, this scans up to `BITS_PER_LONG` PTEs around the target folio's PMD under the existing PTL.  Unlike MGLRU's look-around it does **not** set `PG_referenced` on neighbouring folios — that cascade is the main source of reclaim starvation under fault-heavy workloads.  Instead it feeds the walker via a bloom filter (below).
 - **rmap-fed PMD bloom feedback**.  MGLRU's bloom filter is walker-internal: the walker remembers which PMDs it touched last pass and uses that to skip cold PMDs next pass.  Marie's bloom is cross-component — rmap is the producer ("this PMD had a young PTE on its target"), the walker is the consumer ("only scan PMDs the bloom flagged").  The filter is double-buffered and swapped at the end of each walker pass, so each pass acts on the rmap signal accumulated during the previous reclaim window.
 - **Pressure-adaptive cadence**.  The walker re-evaluates its scan interval (`walker_interval_{critical,low,normal,idle}_ms`) on each pass.  Defaults: `HZ/30`, `HZ/10`, `HZ/4`, `HZ` — all tunable.
@@ -168,18 +168,20 @@ All knobs live under `/sys/kernel/mm/lru_marie/`. Most accept runtime writes; `e
 | Knob                          | Default       | Range / unit                | What it does                                                                                                 |
 | :---------------------------- | :------------ | :-------------------------- | :----------------------------------------------------------------------------------------------------------- |
 | `enabled`                     | `1`           | read-only (boot static key) | Master gate, selected at boot via `lru_marie=`. Read-only at runtime; `0` means Marie was patched out of the hot paths and MGLRU / Legacy took over. |
-| `simd`                        | `1`           | 0 / 1, static key           | Toggles SIMD young-bit scan.  `0` falls back to scalar (A/B testing).                                        |
+| `simd`                        | `1`           | 0 / 1, static key           | Toggles SIMD young-bit scan.  `0` falls back to scalar (A/B testing). Boot-settable via `lru_marie.simd=`.   |
+| `simd_max`                    | `avx512`      | avx512 / avx2 / sse2        | Caps the SIMD ISA the walker may use, below what the CPU supports (e.g. avoid AVX-512 downclocking). Boot-settable via `lru_marie.simd_max=`. x86-only. |
 | `version`                     | —             | read-only                   | Reports the current Marie LRU version.                                                                       |
 | `stats`                       | —             | read-only                   | Exposes internal reclaim and walker statistics.                                                              |
 | `clean_min_ratio`             | `10`          | 0–100, %RAM                 | Hard floor on clean file pages.  Below this, reclaim diverts to anon instead of evicting file.               |
 | `kcompmari`                   | `24`          | -100..+100                  | Async swap queue depth. `0` disables. Positive = Marie-gated; negative = force-enable regardless of Marie. |
 | `gen_growth_threshold`        | `65536`       | folios (`SWAP_CLUSTER_MAX << 11`) | Head-generation growth limit before a new gen is cut.                                                  |
+| `fpu_batch`                   | `4`           | 1..1024 (PMDs)              | Consecutive bloom-hit PMDs scanned under one FPU bracket. Smaller = shorter preempt-disabled window on few-core machines. Boot-settable via `lru_marie.fpu_batch=`. x86-only. |
 | `walker_interval_critical_ms` | `HZ/30` (~33 ms) | ms                       | Walker cadence under critical memory pressure.                                                               |
 | `walker_interval_low_ms`      | `HZ/10` (100 ms) | ms                        | Walker cadence under low pressure.                                                                           |
 | `walker_interval_normal_ms`   | `HZ/4` (250 ms) | ms                         | Walker cadence under normal pressure.                                                                        |
 | `walker_interval_idle_ms`     | `HZ` (1000 ms)  | ms                         | Walker cadence when idle.                                                                                    |
 
-Boot cmdline: `lru_marie=0` disables Marie at boot (and `lru_marie=1` forces it on). This is the only way to select Marie vs MGLRU / Legacy — the choice is latched into the static key before any folio is tracked, so the `enabled` node cannot be flipped at runtime.
+Boot cmdline: `lru_marie=0` disables Marie at boot (and `lru_marie=1` forces it on). This is the only way to select Marie vs MGLRU / Legacy — the choice is latched into the static key before any folio is tracked, so the `enabled` node cannot be flipped at runtime. The x86 SIMD/walker knobs additionally seed from the `lru_marie.` namespace — `lru_marie.simd=0|1`, `lru_marie.simd_max=avx512|avx2|sse2`, `lru_marie.fpu_batch=N` — applied before the first walker pass and overridden by any later sysfs write.
 
 ---
 
@@ -226,7 +228,7 @@ To verify Marie is active after boot:
 
 ```
 cat /sys/kernel/mm/lru_marie/enabled       # 1 = active
-cat /sys/kernel/mm/lru_marie/version       # e.g., 0.5.0
+cat /sys/kernel/mm/lru_marie/version       # e.g., 0.5.1
 ```
 
 ---
@@ -240,13 +242,13 @@ cat /sys/kernel/mm/lru_marie/version       # e.g., 0.5.0
 | ARM64                     | ⚠️ scalar only    | NEON walker pending FPU save/restore profiling vs. the scalar baseline                                               |
 | Other arches              | ⚠️ scalar only    | functional, no SIMD acceleration                                                                                     |
 
-Known kernel bases with Marie 0.5.0 patches in this repo: 6.12.74, 6.18.22, 7.0, 7.1-rc5.  All four ports share a byte-identical Marie core (the `mm/lru_marie/` directory and `include/linux/lru_marie.h`); the few in-tree mm APIs that changed signature across these kernels are isolated behind uniform names in `mm/lru_marie/compat.h`, switched by `LINUX_VERSION_CODE`, so producing a per-version port only re-touches that one header plus the unavoidable context of the integration hunks. Those deltas are:
+Known kernel bases with Marie 0.5.1 patches in this repo: 6.12.74, 6.18.22, 7.0, 7.1-rc5.  All four ports share a byte-identical Marie core (the `mm/lru_marie/` directory and `include/linux/lru_marie.h`); the few in-tree mm APIs that changed signature across these kernels are isolated behind uniform names in `mm/lru_marie/compat.h`, switched by `LINUX_VERSION_CODE`, so producing a per-version port only re-touches that one header plus the unavoidable context of the integration hunks. Those deltas are:
 
 - `folio->flags` became the typed `memdesc_flags_t` (`struct { unsigned long f; }`) in **6.18**; `shrink_folio_list()` gained a `memcg` parameter and `folio_pte_batch()` was replaced by `folio_pte_batch_flags()` in **6.18**;
 - `arch_enter/leave_lazy_mmu_mode()` were renamed to `lazy_mmu_mode_enable/disable()` in **7.0** (compat.h provides the new names on 6.12 / 6.18);
 - the batched no-flush young-PTE API `test_and_clear_young_ptes_notify()` is native on **7.1** (compat.h emulates it as a per-PTE `ptep_clear_young_notify()` loop on 6.12 / 6.18 / 7.0).
 
-Because Marie 0.5.0 is desktop/global-only, it carries no per-memcg lifecycle hooks, which removes the largest source of cross-version churn (notably the 7.1 objcg-reparent handling that earlier per-memcg revisions needed).
+Because Marie 0.5.1 is desktop/global-only, it carries no per-memcg lifecycle hooks, which removes the largest source of cross-version churn (notably the 7.1 objcg-reparent handling that earlier per-memcg revisions needed).
 
 ---
 
