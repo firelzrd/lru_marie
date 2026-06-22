@@ -24,7 +24,7 @@ Legend — ✅ behaves as expected · ⚠️ works but with a structural trade-o
 
 | Aspect                | Legacy LRU                                                                | MGLRU                                                                                                       | Marie                                                                                                       |
 | :-------------------- | :------------------------------------------------------------------------ | :---------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------- |
-| Aging granularity     | ⚠️ binary active / inactive only                                           | ✅ 4-gen ring (`MAX_NR_GENS=4`); a full ring triggers a forced `inc_min_seq` oldest-gen drain                 | ✅ 4-gen ring (`MARIE_PFN_NR_GENS=4`); advance skips when the ring is full, no forced drain                  |
+| Aging granularity     | ⚠️ binary active / inactive only                                           | ✅ 4-gen ring (`MAX_NR_GENS=4`); a full ring triggers a forced `inc_min_seq` oldest-gen drain                 | ✅ 8-gen ring (`MARIE_PFN_NR_GENS=8`); advance skips when the ring is full, no forced drain                  |
 | anon/file iteration   | ✅ per-type lists; `vm.swappiness` works as a proportional anon:file ratio | ❌ shared `max_seq` across anon/file reduces `vm.swappiness` to a per-generation hint                        | ✅ per-type `seq` / `min_seq` / ring; restores `vm.swappiness` as a proportional ratio                       |
 | Hot-signal harvest    | ⚠️ rmap-driven `PG_referenced` only; no active walker                      | ✅ PTE walker + walker-internal PMD bloom filter + rmap look-around cascading `PG_referenced`                | ✅ Vectorized PTE walker + rmap-fed PMD bloom filter + rmap look-around updating a saturating tier bit only            |
 | Compression stall     | ❌ kswapd blocks inside `zswap_store`                                      | ❌ kswapd blocks inside `zswap_store`                                                                        | ✅ offloaded to per-node `kcompmari` kthread                                                                 |
@@ -116,8 +116,8 @@ Marie tracks a folio's lifecycle entirely via a single byte per PFN in `marie_st
 - **1 bit TRACKED**: 1 = owned by Marie, 0 = untracked.
 - **1 bit TYPE**: anon or file.
 - **2 bits ZONE**: `folio_zonenum`.
-- **2 bits GEN**: relative position (0..3) in the cycling ring.
-- **2 bits TIER**: saturating hotness counter (0..3), bumped by the walker or rmap.
+- **3 bits GEN**: relative position (0..7) in the cycling ring.
+- **1 bit TIER**: hotness flag (0 = cold, 1 = referenced/active), bumped by the walker or rmap; saturating (a second hit promotes the folio to the head gen).
 
 Because state is purely array-based, there are no `list_del` or `swap-pop` operations during eviction or installation. `marie_state[pfn] = 0` instantly drops tracking. To isolate folios, Marie uses an **L2-pruned `__ffs`/`blsr` walk** combined with **Two-Stage Software Prefetching**:
 - **L2-pruning**: Scanning the global (type, gen, tier) L2 bitmap for the target bucket skips empty 32 MiB chunks in 1 CPU cycle.
@@ -128,9 +128,11 @@ Because state is purely array-based, there are no `list_del` or `swap-pop` opera
 
 MGLRU's ring has `MAX_NR_GENS=4`.  When it fills, aging calls `try_to_inc_min_seq()` to push the oldest gen forward before cutting a new head.  If that oldest gen holds folios that won't move — clean file pages under a working-set policy, mlocked anon, etc. — aging still demands forward progress, so the same untouchable folios get rewalked over and over: the *forced `inc_min_seq` treadmill*.
 
-Marie uses a 4-gen cap (`MARIE_PFN_NR_GENS=4`) tracked by `marie_head_gen[type]`. Head-generation advance is *drain-wait gated*: `marie_try_advance_head()` will not advance if the next slot in the ring still contains folios.
+Marie uses an 8-gen cap (`MARIE_PFN_NR_GENS=8`) tracked by `marie_head_gen[type]`. Head-generation advance is *drain-wait gated*: `marie_try_advance_head()` will not advance if the next slot in the ring still contains folios.
 
 Practical effect: an oldest gen full of `clean_min_ratio`-protected folios is left alone.  Aging stops growing new heads until reclaim drains the existing tail (or `clean_min_ratio` diverts the type selector to anon).  The treadmill never starts because nothing in Marie demands aging-side progress regardless of consumer state.
+
+The 8-gen ring (3 GEN bits) is a deliberate trade against the TIER field, which is correspondingly 1 bit: the wider ring lengthens a folio's head→oldest descent (its time-domain reclaim grace), giving the walker's hot-signal harvest more passes to re-promote a *warm* folio — one re-accessed on a period comparable to that descent — before it reaches reclaim range. In a warm-set A/B this cut warm-folio refaults ~40% versus a 4-gen / 4-tier split; the narrower 2-tier recency field measured neutral (a 4-gen / 2-tier control did not reproduce the gain, isolating it to the gen count rather than the promotion threshold).
 
 ### Independent anon/file pipelines
 
@@ -228,7 +230,7 @@ To verify Marie is active after boot:
 
 ```
 cat /sys/kernel/mm/lru_marie/enabled       # 1 = active
-cat /sys/kernel/mm/lru_marie/version       # e.g., 0.5.1
+cat /sys/kernel/mm/lru_marie/version       # e.g., 0.6.0
 ```
 
 ---
@@ -242,13 +244,13 @@ cat /sys/kernel/mm/lru_marie/version       # e.g., 0.5.1
 | ARM64                     | ⚠️ scalar only    | NEON walker pending FPU save/restore profiling vs. the scalar baseline                                               |
 | Other arches              | ⚠️ scalar only    | functional, no SIMD acceleration                                                                                     |
 
-Known kernel bases with Marie 0.5.1 patches in this repo: 6.12.74, 6.18.22, 7.0, 7.1-rc5.  All four ports share a byte-identical Marie core (the `mm/lru_marie/` directory and `include/linux/lru_marie.h`); the few in-tree mm APIs that changed signature across these kernels are isolated behind uniform names in `mm/lru_marie/compat.h`, switched by `LINUX_VERSION_CODE`, so producing a per-version port only re-touches that one header plus the unavoidable context of the integration hunks. Those deltas are:
+Known kernel bases with Marie 0.6.0 patches in this repo: 6.12.74, 6.18.22, 7.0, 7.1-rc5.  All four ports share a byte-identical Marie core (the `mm/lru_marie/` directory and `include/linux/lru_marie.h`); the few in-tree mm APIs that changed signature across these kernels are isolated behind uniform names in `mm/lru_marie/compat.h`, switched by `LINUX_VERSION_CODE`, so producing a per-version port only re-touches that one header plus the unavoidable context of the integration hunks. Those deltas are:
 
 - `folio->flags` became the typed `memdesc_flags_t` (`struct { unsigned long f; }`) in **6.18**; `shrink_folio_list()` gained a `memcg` parameter and `folio_pte_batch()` was replaced by `folio_pte_batch_flags()` in **6.18**;
 - `arch_enter/leave_lazy_mmu_mode()` were renamed to `lazy_mmu_mode_enable/disable()` in **7.0** (compat.h provides the new names on 6.12 / 6.18);
 - the batched no-flush young-PTE API `test_and_clear_young_ptes_notify()` is native on **7.1** (compat.h emulates it as a per-PTE `ptep_clear_young_notify()` loop on 6.12 / 6.18 / 7.0).
 
-Because Marie 0.5.1 is desktop/global-only, it carries no per-memcg lifecycle hooks, which removes the largest source of cross-version churn (notably the 7.1 objcg-reparent handling that earlier per-memcg revisions needed).
+Because Marie 0.6.0 is desktop/global-only, it carries no per-memcg lifecycle hooks, which removes the largest source of cross-version churn (notably the 7.1 objcg-reparent handling that earlier per-memcg revisions needed).
 
 ---
 
