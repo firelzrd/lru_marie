@@ -1,7 +1,7 @@
-From 79eb6f42f194c7a1dc5c95262f6ab6c950d9f290 Mon Sep 17 00:00:00 2001
+From c3d917d893295e4e640570ba88fde9c33afe98dc Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Wed, 24 Jun 2026 03:58:57 +0900
-Subject: [PATCH] linux7.1-rc5-lru_marie-0.6.1
+Date: Wed, 24 Jun 2026 09:46:53 +0900
+Subject: [PATCH] linux7.1-rc5-lru_marie-0.6.2
 
 ---
  include/linux/lru_marie.h      |  469 ++++++
@@ -17,7 +17,6 @@ Subject: [PATCH] linux7.1-rc5-lru_marie-0.6.1
  mm/lru_marie/account.h         |  106 ++
  mm/lru_marie/bitmap.c          |  118 ++
  mm/lru_marie/bitmap.h          |  205 +++
- mm/lru_marie/compat.h          |  126 ++
  mm/lru_marie/core.c            | 1193 ++++++++++++++
  mm/lru_marie/pfn_install.h     |  137 ++
  mm/lru_marie/prefetch.h        |  111 ++
@@ -27,10 +26,12 @@ Subject: [PATCH] linux7.1-rc5-lru_marie-0.6.1
  mm/lru_marie/simd_x86_avx2.S   |  152 ++
  mm/lru_marie/simd_x86_avx512.S |  199 +++
  mm/lru_marie/simd_x86_sse2.S   |  158 ++
- mm/lru_marie/state.c           | 2751 ++++++++++++++++++++++++++++++++
+ mm/lru_marie/state.c           | 2736 ++++++++++++++++++++++++++++++++
  mm/lru_marie/state.h           |  925 +++++++++++
+ mm/lru_marie/state_compat.h    |   94 ++
  mm/lru_marie/version.h         |   22 +
- mm/lru_marie/walker.c          |  968 +++++++++++
+ mm/lru_marie/walker.c          |  969 +++++++++++
+ mm/lru_marie/walker_compat.h   |   82 +
  mm/memcontrol-v1.c             |   11 +
  mm/memcontrol.c                |   21 +
  mm/mm_init.c                   |    3 +
@@ -40,13 +41,12 @@ Subject: [PATCH] linux7.1-rc5-lru_marie-0.6.1
  mm/swap.c                      |  248 ++-
  mm/swap.h                      |    4 +
  mm/vmscan.c                    |  347 +++-
- 36 files changed, 9252 insertions(+), 23 deletions(-)
+ 37 files changed, 9288 insertions(+), 23 deletions(-)
  create mode 100644 include/linux/lru_marie.h
  create mode 100644 mm/lru_marie/Makefile
  create mode 100644 mm/lru_marie/account.h
  create mode 100644 mm/lru_marie/bitmap.c
  create mode 100644 mm/lru_marie/bitmap.h
- create mode 100644 mm/lru_marie/compat.h
  create mode 100644 mm/lru_marie/core.c
  create mode 100644 mm/lru_marie/pfn_install.h
  create mode 100644 mm/lru_marie/prefetch.h
@@ -58,8 +58,10 @@ Subject: [PATCH] linux7.1-rc5-lru_marie-0.6.1
  create mode 100644 mm/lru_marie/simd_x86_sse2.S
  create mode 100644 mm/lru_marie/state.c
  create mode 100644 mm/lru_marie/state.h
+ create mode 100644 mm/lru_marie/state_compat.h
  create mode 100644 mm/lru_marie/version.h
  create mode 100644 mm/lru_marie/walker.c
+ create mode 100644 mm/lru_marie/walker_compat.h
 
 diff --git a/include/linux/lru_marie.h b/include/linux/lru_marie.h
 new file mode 100644
@@ -1495,138 +1497,6 @@ index 0000000000..eb4b6ee263
 +}
 +
 +#endif	/* _MM_LRU_MARIE_BITMAP_H */
-diff --git a/mm/lru_marie/compat.h b/mm/lru_marie/compat.h
-new file mode 100644
-index 0000000000..d57fba4742
---- /dev/null
-+++ b/mm/lru_marie/compat.h
-@@ -0,0 +1,126 @@
-+/* SPDX-License-Identifier: GPL-2.0 */
-+#ifndef _MM_LRU_MARIE_COMPAT_H
-+#define _MM_LRU_MARIE_COMPAT_H
-+
-+/*
-+ * Per-kernel-version adaptation layer.
-+ *
-+ * Marie's core (the mm/lru_marie/ sources) is meant to be byte-identical across every
-+ * kernel it is ported to (currently 6.12 / 6.18 / 7.0 / 7.1).  The only core
-+ * code that genuinely has to differ per version is a handful of in-tree mm
-+ * APIs that changed signature.  They are ALL isolated here, behind uniform
-+ * names, so producing a per-version patch re-touches this one file plus the
-+ * unavoidable context lines of the integration hunks -- never the bulk of the
-+ * core.
-+ *
-+ * Two adaptation idioms are used:
-+ *   1. a macro that resolves to the version's spelling of an lvalue
-+ *      (MARIE_FOLIO_FLAGS), and
-+ *   2. a static-inline wrapper that exposes the UNION of arguments across
-+ *      versions and drops/synthesises the ones a given version lacks
-+ *      (marie_shrink_folio_list, marie_folio_pte_batch).
-+ *
-+ * Include AFTER "../internal.h" (and the usual mm headers): the wrappers are
-+ * static inline and need the underlying declarations + struct types complete.
-+ *
-+ * Version boundaries below match the four supported targets exactly; revisit
-+ * them when adding a new target kernel.
-+ */
-+
-+#include <linux/version.h>
-+#include <linux/mmu_notifier.h>	/* ptep_clear_young_notify (young-ptes shim) */
-+
-+/*
-+ * folio->flags became the typed memdesc_flags_t -- struct { unsigned long f; }
-+ * -- in 6.18 (upstream series "Add and use memdesc_flags_t", first commit
-+ * 53fbef56e07d; <6.18 is a plain unsigned long, so this boundary is exact, not
-+ * just target-derived).  The macro yields the raw "unsigned long" lvalue on
-+ * every version, so both a read (`MARIE_FOLIO_FLAGS(f) & MASK`) and a bit op
-+ * (`set_mask_bits(&MARIE_FOLIO_FLAGS(f), ...)`) are version-agnostic.
-+ *
-+ * Marie touches the raw word in only the two narrow spots the page-flag
-+ * accessors do not cover: clearing stale LRU_GEN/LRU_REFS residue and the
-+ * single atomic PG_active->0 + PG_lru->1 publish.
-+ */
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
-+#define MARIE_FOLIO_FLAGS(folio)	((folio)->flags.f)
-+#else
-+#define MARIE_FOLIO_FLAGS(folio)	((folio)->flags)
-+#endif
-+
-+/*
-+ * shrink_folio_list() gained a trailing @memcg parameter in 6.18 (the scan is
-+ * told which memcg it is reclaiming for).  Marie always has the memcg in hand
-+ * at the call site, so the uniform wrapper takes it unconditionally and simply
-+ * does not forward it on the pre-6.18 signature.
-+ */
-+static inline unsigned int
-+marie_shrink_folio_list(struct list_head *folio_list, struct pglist_data *pgdat,
-+			struct scan_control *sc, struct reclaim_stat *stat,
-+			bool ignore_references, struct mem_cgroup *memcg)
-+{
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
-+	return shrink_folio_list(folio_list, pgdat, sc, stat, ignore_references,
-+				 memcg);
-+#else
-+	return shrink_folio_list(folio_list, pgdat, sc, stat, ignore_references);
-+#endif
-+}
-+
-+/*
-+ * Look-around neighbour batching.  6.12 has folio_pte_batch() with the long
-+ * (max_nr, FPB flags, out-params) signature; 6.18+ replaced it with
-+ * folio_pte_batch_flags(folio, vma, ptep, &pte, max_nr, FPB_*).  Both collapse
-+ * a run of present PTEs mapping @folio while ignoring young/dirty differences:
-+ *   - 6.12: FPB_MERGE_YOUNG_DIRTY does not exist, but folio_pte_batch()
-+ *     pte_mkold()s before comparing, so FPB_IGNORE_DIRTY alone gives the same
-+ *     young/dirty-agnostic batching.
-+ *   - 6.18+: FPB_MERGE_YOUNG_DIRTY merges across young/dirty directly.
-+ * The uniform wrapper takes the 6.12 argument set (@addr is unused on 6.18+).
-+ */
-+static inline int
-+marie_folio_pte_batch(struct folio *folio, unsigned long addr, pte_t *ptep,
-+		      pte_t pte, unsigned int max_nr)
-+{
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
-+	return folio_pte_batch_flags(folio, NULL, ptep, &pte, max_nr,
-+				     FPB_MERGE_YOUNG_DIRTY);
-+#else
-+	return folio_pte_batch(folio, addr, ptep, pte, max_nr, FPB_IGNORE_DIRTY,
-+			       NULL, NULL, NULL);
-+#endif
-+}
-+
-+/*
-+ * arch_enter/leave_lazy_mmu_mode() were renamed to
-+ * lazy_mmu_mode_enable/disable() in 7.0.  Provide the new names on the older
-+ * targets so the walker can use one spelling.
-+ */
-+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
-+#define lazy_mmu_mode_enable()	arch_enter_lazy_mmu_mode()
-+#define lazy_mmu_mode_disable()	arch_leave_lazy_mmu_mode()
-+#endif
-+
-+/*
-+ * test_and_clear_young_ptes_notify() -- the batched young-clear with
-+ * mmu-notifier callback -- landed in 7.1.  On older targets emulate it as a
-+ * per-PTE ptep_clear_young_notify() loop; functionally equivalent, losing only
-+ * the batched-notifier amortisation.
-+ */
-+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 1, 0)
-+static inline int marie_test_and_clear_young_ptes(struct vm_area_struct *vma,
-+						  unsigned long addr,
-+						  pte_t *pte, unsigned int nr)
-+{
-+	int young = 0;
-+	unsigned int i;
-+
-+	for (i = 0; i < nr; i++)
-+		young |= ptep_clear_young_notify(vma, addr + i * PAGE_SIZE,
-+						 pte + i);
-+	return young;
-+}
-+#define test_and_clear_young_ptes_notify marie_test_and_clear_young_ptes
-+#endif
-+
-+#endif /* _MM_LRU_MARIE_COMPAT_H */
 diff --git a/mm/lru_marie/core.c b/mm/lru_marie/core.c
 new file mode 100644
 index 0000000000..c2e4a27265
@@ -4059,10 +3929,10 @@ index 0000000000..71f8eff7e5
 +SYM_FUNC_END(lru_marie_simd_scan_sse2)
 diff --git a/mm/lru_marie/state.c b/mm/lru_marie/state.c
 new file mode 100644
-index 0000000000..559f30db27
+index 0000000000..5de407fe70
 --- /dev/null
 +++ b/mm/lru_marie/state.c
-@@ -0,0 +1,2751 @@
+@@ -0,0 +1,2736 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Marie per-PFN state array — allocation, init, and global counters.
@@ -4109,7 +3979,7 @@ index 0000000000..559f30db27
 +#endif
 +
 +#include "../internal.h"	/* struct scan_control, shrink_folio_list */
-+#include "compat.h"	/* MARIE_FOLIO_FLAGS, marie_shrink_folio_list */
++#include "state_compat.h"	/* MARIE_FOLIO_FLAGS, marie_shrink_folio_list, marie_account_reclaim */
 +#include "account.h"
 +#include "pfn_install.h"
 +#include "prefetch.h"
@@ -5897,19 +5767,12 @@ index 0000000000..559f30db27
 +			 * back).
 +			 */
 +			{
-+				enum vm_event_item scan_item =
-+					PGSCAN_KSWAPD +
-+					vmscan_reclaimer_offset(sc);
-+
 +				mod_node_page_state(pgdat,
 +						    NR_ISOLATED_ANON + type,
 +						    n_taken_pages);
-+				if (!sc_cgroup_reclaim(sc))
-+					count_vm_events(scan_item, n_taken_pages);
-+				count_memcg_events(memcg, scan_item,
-+						   n_taken_pages);
-+				count_vm_events(PGSCAN_ANON + type,
-+						n_taken_pages);
++				marie_account_reclaim(lruvec, sc,
++						PGSCAN_KSWAPD, PGSCAN_ANON,
++						type, n_taken_pages);
 +			}
 +
 +			n_reclaimed = marie_shrink_folio_list(&folio_list, pgdat,
@@ -5928,20 +5791,12 @@ index 0000000000..559f30db27
 +			 * isolation window for these n_taken folios is over.
 +			 */
 +			{
-+				enum vm_event_item steal_item =
-+					PGSTEAL_KSWAPD +
-+					vmscan_reclaimer_offset(sc);
-+
 +				mod_node_page_state(pgdat,
 +						    NR_ISOLATED_ANON + type,
 +						    -n_taken_pages);
-+				if (!sc_cgroup_reclaim(sc))
-+					count_vm_events(steal_item,
-+							n_reclaimed);
-+				count_memcg_events(memcg, steal_item,
-+						   n_reclaimed);
-+				count_vm_events(PGSTEAL_ANON + type,
-+						n_reclaimed);
++				marie_account_reclaim(lruvec, sc,
++						PGSTEAL_KSWAPD, PGSTEAL_ANON,
++						type, n_reclaimed);
 +			}
 +
 +			oldest_for_putback =
@@ -7745,9 +7600,109 @@ index 0000000000..56b28656f1
 +
 +#endif /* CONFIG_LRU_MARIE */
 +#endif /* _MM_LRU_MARIE_STATE_H */
+diff --git a/mm/lru_marie/state_compat.h b/mm/lru_marie/state_compat.h
+new file mode 100644
+index 0000000000..4d07cedd9c
+--- /dev/null
++++ b/mm/lru_marie/state_compat.h
+@@ -0,0 +1,94 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _MM_LRU_MARIE_STATE_COMPAT_H
++#define _MM_LRU_MARIE_STATE_COMPAT_H
++
++/*
++ * Per-kernel-version adaptation layer for the reclaim state machine (state.c).
++ *
++ * Marie's core sources are meant to be byte-identical across every kernel it is
++ * ported to (currently 6.12 / 6.18 / 7.0 / 7.1).  The only core code that
++ * genuinely has to differ per version is a handful of in-tree mm APIs that
++ * changed signature; the reclaim side's share of those is isolated here behind
++ * uniform names (the walker side lives in walker_compat.h), so producing a
++ * per-version patch re-touches just these small headers plus the unavoidable
++ * context lines of the integration hunks -- never the bulk of the core.
++ *
++ * Include AFTER "../internal.h" and the usual mm headers (in particular
++ * <linux/vmstat.h> and <linux/memcontrol.h>): the wrappers are static inline
++ * and need the underlying declarations + struct types complete.
++ *
++ * Version boundaries below match the four supported targets exactly; revisit
++ * them when adding a new target kernel.
++ */
++
++#include <linux/version.h>
++
++/*
++ * folio->flags became the typed memdesc_flags_t -- struct { unsigned long f; }
++ * -- in 6.18 (upstream series "Add and use memdesc_flags_t", first commit
++ * 53fbef56e07d; <6.18 is a plain unsigned long, so this boundary is exact, not
++ * just target-derived).  The macro yields the raw "unsigned long" lvalue on
++ * every version, so both a read (`MARIE_FOLIO_FLAGS(f) & MASK`) and a bit op
++ * (`set_mask_bits(&MARIE_FOLIO_FLAGS(f), ...)`) are version-agnostic.
++ *
++ * Marie touches the raw word in only the two narrow spots the page-flag
++ * accessors do not cover: clearing stale LRU_GEN/LRU_REFS residue and the
++ * single atomic PG_active->0 + PG_lru->1 publish.
++ */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
++#define MARIE_FOLIO_FLAGS(folio)	((folio)->flags.f)
++#else
++#define MARIE_FOLIO_FLAGS(folio)	((folio)->flags)
++#endif
++
++/*
++ * shrink_folio_list() gained a trailing @memcg parameter in 6.18 (the scan is
++ * told which memcg it is reclaiming for).  Marie always has the memcg in hand
++ * at the call site, so the uniform wrapper takes it unconditionally and simply
++ * does not forward it on the pre-6.18 signature.
++ */
++static inline unsigned int
++marie_shrink_folio_list(struct list_head *folio_list, struct pglist_data *pgdat,
++			struct scan_control *sc, struct reclaim_stat *stat,
++			bool ignore_references, struct mem_cgroup *memcg)
++{
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
++	return shrink_folio_list(folio_list, pgdat, sc, stat, ignore_references,
++				 memcg);
++#else
++	return shrink_folio_list(folio_list, pgdat, sc, stat, ignore_references);
++#endif
++}
++
++/*
++ * Reclaim-counter accounting.
++ *
++ * 7.1 relocated the PGSTEAL, PGSCAN, PGDEMOTE and PGREFILL counters out of
++ * enum vm_event_item into enum node_stat_item (they are per-memcg lruvec stats
++ * now).  Route the post-isolation (PGSCAN) and post-reclaim (PGSTEAL) bumps
++ * through whichever API the building kernel exposes.  @base is the
++ * PG{SCAN,STEAL}_KSWAPD reclaimer-offset base, @per_type the PG{SCAN,STEAL}_ANON
++ * counter indexed by the anon/file @type; both are passed as int so the call
++ * site is identical whichever enum they live in.
++ */
++static inline void marie_account_reclaim(struct lruvec *lruvec,
++					 struct scan_control *sc,
++					 int base, int per_type,
++					 int type, unsigned long nr)
++{
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
++	/* node_stat_item: one lruvec update folds node vmstat + memcg stat. */
++	mod_lruvec_state(lruvec, base + vmscan_reclaimer_offset(sc), nr);
++	mod_lruvec_state(lruvec, per_type + type, nr);
++#else
++	/* vm_event_item: global (skipped for cgroup reclaim) + memcg + type. */
++	int item = base + vmscan_reclaimer_offset(sc);
++
++	if (!sc_cgroup_reclaim(sc))
++		count_vm_events(item, nr);
++	count_memcg_events(lruvec_memcg(lruvec), item, nr);
++	count_vm_events(per_type + type, nr);
++#endif
++}
++
++#endif /* _MM_LRU_MARIE_STATE_COMPAT_H */
 diff --git a/mm/lru_marie/version.h b/mm/lru_marie/version.h
 new file mode 100644
-index 0000000000..5a37a34767
+index 0000000000..33894e04fd
 --- /dev/null
 +++ b/mm/lru_marie/version.h
 @@ -0,0 +1,22 @@
@@ -7770,15 +7725,15 @@ index 0000000000..5a37a34767
 +#define MARIE_PROGNAME	"Marie LRU"
 +#define MARIE_AUTHOR	"Masahito Suzuki"
 +
-+#define MARIE_VERSION	"0.6.1"
++#define MARIE_VERSION	"0.6.2"
 +
 +#endif /* _MM_LRU_MARIE_VERSION_H */
 diff --git a/mm/lru_marie/walker.c b/mm/lru_marie/walker.c
 new file mode 100644
-index 0000000000..c642168007
+index 0000000000..e047779206
 --- /dev/null
 +++ b/mm/lru_marie/walker.c
-@@ -0,0 +1,968 @@
+@@ -0,0 +1,969 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * mm/lru_marie/walker.c — Marie's SIMD-accelerated PTE walker.
@@ -7846,7 +7801,7 @@ index 0000000000..c642168007
 +#include <linux/xarray.h>
 +
 +#include "../internal.h"	/* folio_pte_batch_flags / FPB_MERGE_YOUNG_DIRTY */
-+#include "compat.h"	/* marie_folio_pte_batch, lazy_mmu / young-ptes shims */
++#include "walker_compat.h"	/* marie_folio_pte_batch, lazy_mmu / young-ptes shims */
 +#include "state.h"
 +#include "simd.h"
 +
@@ -7888,7 +7843,8 @@ index 0000000000..c642168007
 +
 +/*
 + * Version-shimmed mm APIs (test_and_clear_young_ptes_notify, lazy_mmu_mode_*,
-+ * folio_pte_batch) live in compat.h so this file is identical across kernels.
++ * folio_pte_batch) live in walker_compat.h so this file is identical across
++ * kernels.
 + */
 +
 +/* Forward decl: bloom Producer used by look_around. Definition lives in
@@ -8017,7 +7973,7 @@ index 0000000000..c642168007
 +		if (folio_test_large(folio)) {
 +			const unsigned int max_nr = (end - addr) >> PAGE_SHIFT;
 +
-+			/* Version-agnostic neighbour batching; see compat.h. */
++			/* Version-agnostic neighbour batching; see walker_compat.h. */
 +			nr = marie_folio_pte_batch(folio, addr, pte, ptent, max_nr);
 +		}
 +
@@ -8747,6 +8703,94 @@ index 0000000000..c642168007
 +	for (nid = 0; nid < MAX_NUMNODES; nid++)
 +		spin_lock_init(&marie_blooms[nid].lock);
 +}
+diff --git a/mm/lru_marie/walker_compat.h b/mm/lru_marie/walker_compat.h
+new file mode 100644
+index 0000000000..5942d25151
+--- /dev/null
++++ b/mm/lru_marie/walker_compat.h
+@@ -0,0 +1,82 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _MM_LRU_MARIE_WALKER_COMPAT_H
++#define _MM_LRU_MARIE_WALKER_COMPAT_H
++
++/*
++ * Per-kernel-version adaptation layer for the page-table walker (walker.c).
++ *
++ * Marie's core sources are meant to be byte-identical across every kernel it is
++ * ported to (currently 6.12 / 6.18 / 7.0 / 7.1).  The only core code that
++ * genuinely has to differ per version is a handful of in-tree mm APIs that
++ * changed signature; the walker's share of those is isolated here behind
++ * uniform names (the reclaim side lives in state_compat.h), so producing a
++ * per-version patch re-touches just these small headers plus the unavoidable
++ * context lines of the integration hunks -- never the bulk of the core.
++ *
++ * Include AFTER "../internal.h" (and the usual mm headers): the wrappers are
++ * static inline and need the underlying declarations + struct types complete.
++ *
++ * Version boundaries below match the four supported targets exactly; revisit
++ * them when adding a new target kernel.
++ */
++
++#include <linux/version.h>
++#include <linux/mmu_notifier.h>	/* ptep_clear_young_notify (young-ptes shim) */
++
++/*
++ * Look-around neighbour batching.  6.12 has folio_pte_batch() with the long
++ * (max_nr, FPB flags, out-params) signature; 6.18+ replaced it with
++ * folio_pte_batch_flags(folio, vma, ptep, &pte, max_nr, FPB_*).  Both collapse
++ * a run of present PTEs mapping @folio while ignoring young/dirty differences:
++ *   - 6.12: FPB_MERGE_YOUNG_DIRTY does not exist, but folio_pte_batch()
++ *     pte_mkold()s before comparing, so FPB_IGNORE_DIRTY alone gives the same
++ *     young/dirty-agnostic batching.
++ *   - 6.18+: FPB_MERGE_YOUNG_DIRTY merges across young/dirty directly.
++ * The uniform wrapper takes the 6.12 argument set (@addr is unused on 6.18+).
++ */
++static inline int
++marie_folio_pte_batch(struct folio *folio, unsigned long addr, pte_t *ptep,
++		      pte_t pte, unsigned int max_nr)
++{
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
++	return folio_pte_batch_flags(folio, NULL, ptep, &pte, max_nr,
++				     FPB_MERGE_YOUNG_DIRTY);
++#else
++	return folio_pte_batch(folio, addr, ptep, pte, max_nr, FPB_IGNORE_DIRTY,
++			       NULL, NULL, NULL);
++#endif
++}
++
++/*
++ * arch_enter/leave_lazy_mmu_mode() were renamed to
++ * lazy_mmu_mode_enable/disable() in 7.0.  Provide the new names on the older
++ * targets so the walker can use one spelling.
++ */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
++#define lazy_mmu_mode_enable()	arch_enter_lazy_mmu_mode()
++#define lazy_mmu_mode_disable()	arch_leave_lazy_mmu_mode()
++#endif
++
++/*
++ * test_and_clear_young_ptes_notify() -- the batched young-clear with
++ * mmu-notifier callback -- landed in 7.1.  On older targets emulate it as a
++ * per-PTE ptep_clear_young_notify() loop; functionally equivalent, losing only
++ * the batched-notifier amortisation.
++ */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 1, 0)
++static inline int marie_test_and_clear_young_ptes(struct vm_area_struct *vma,
++						  unsigned long addr,
++						  pte_t *pte, unsigned int nr)
++{
++	int young = 0;
++	unsigned int i;
++
++	for (i = 0; i < nr; i++)
++		young |= ptep_clear_young_notify(vma, addr + i * PAGE_SIZE,
++						 pte + i);
++	return young;
++}
++#define test_and_clear_young_ptes_notify marie_test_and_clear_young_ptes
++#endif
++
++#endif /* _MM_LRU_MARIE_WALKER_COMPAT_H */
 diff --git a/mm/memcontrol-v1.c b/mm/memcontrol-v1.c
 index 433bba9dfe..a7923ef2fa 100644
 --- a/mm/memcontrol-v1.c
