@@ -1,10 +1,10 @@
-From c8e6c95708e74b07f55ed2aab838ed4d2d85df76 Mon Sep 17 00:00:00 2001
+From 6887b01aeb0e933ebdc4f1edd58279d516c11c81 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Fri, 3 Jul 2026 15:56:41 +0900
-Subject: [PATCH] linux6.12.74-lru_marie-0.6.6
+Date: Mon, 6 Jul 2026 02:02:50 +0900
+Subject: [PATCH] linux6.12.74-lru_marie-0.6.7
 
 ---
- include/linux/lru_marie.h      |  468 ++++++
+ include/linux/lru_marie.h      |  469 ++++++
  include/linux/memcontrol.h     |   26 +-
  include/linux/mm_inline.h      |  103 +-
  include/linux/mmzone.h         |   16 +
@@ -18,7 +18,7 @@ Subject: [PATCH] linux6.12.74-lru_marie-0.6.6
  mm/lru_marie/account.h         |  106 ++
  mm/lru_marie/bitmap.c          |  118 ++
  mm/lru_marie/bitmap.h          |  205 +++
- mm/lru_marie/core.c            | 1163 +++++++++++++
+ mm/lru_marie/core.c            | 1218 ++++++++++++++
  mm/lru_marie/pfn_install.h     |  138 ++
  mm/lru_marie/prefetch.h        |  111 ++
  mm/lru_marie/simd.h            |  109 ++
@@ -27,7 +27,7 @@ Subject: [PATCH] linux6.12.74-lru_marie-0.6.6
  mm/lru_marie/simd_x86_avx2.S   |  152 ++
  mm/lru_marie/simd_x86_avx512.S |  199 +++
  mm/lru_marie/simd_x86_sse2.S   |  158 ++
- mm/lru_marie/state.c           | 2832 ++++++++++++++++++++++++++++++++
+ mm/lru_marie/state.c           | 2844 ++++++++++++++++++++++++++++++++
  mm/lru_marie/state.h           |  961 +++++++++++
  mm/lru_marie/state_compat.h    |   94 ++
  mm/lru_marie/version.h         |   22 +
@@ -42,8 +42,8 @@ Subject: [PATCH] linux6.12.74-lru_marie-0.6.6
  mm/rmap.c                      |    6 +
  mm/swap.c                      |  248 ++-
  mm/swap.h                      |    4 +
- mm/vmscan.c                    |  324 +++-
- 39 files changed, 9552 insertions(+), 28 deletions(-)
+ mm/vmscan.c                    |  313 +++-
+ 39 files changed, 9609 insertions(+), 28 deletions(-)
  create mode 100644 include/linux/lru_marie.h
  create mode 100644 mm/lru_marie/Makefile
  create mode 100644 mm/lru_marie/account.h
@@ -67,10 +67,10 @@ Subject: [PATCH] linux6.12.74-lru_marie-0.6.6
 
 diff --git a/include/linux/lru_marie.h b/include/linux/lru_marie.h
 new file mode 100644
-index 0000000000..aa4b08bc31
+index 0000000000..bd0f5eb84c
 --- /dev/null
 +++ b/include/linux/lru_marie.h
-@@ -0,0 +1,468 @@
+@@ -0,0 +1,469 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _LINUX_LRU_MARIE_H
 +#define _LINUX_LRU_MARIE_H
@@ -471,6 +471,7 @@ index 0000000000..aa4b08bc31
 +extern unsigned long marie_walker_interval_normal;	/* jiffies */
 +extern unsigned long marie_walker_interval_idle;	/* jiffies */
 +extern unsigned int  marie_fpu_batch;			/* PMDs per FPU bracket */
++extern unsigned int  marie_low_swappiness_mode;		/* bool; clamp effective swappiness to <=1 */
 +
 +#ifdef CONFIG_SWAP
 +/*
@@ -1576,10 +1577,10 @@ index 0000000000..eb4b6ee263
 +#endif	/* _MM_LRU_MARIE_BITMAP_H */
 diff --git a/mm/lru_marie/core.c b/mm/lru_marie/core.c
 new file mode 100644
-index 0000000000..b6cba1d807
+index 0000000000..4e31e50877
 --- /dev/null
 +++ b/mm/lru_marie/core.c
-@@ -0,0 +1,1163 @@
+@@ -0,0 +1,1218 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * mm/lru_marie/core.c — Marie LRU.
@@ -1620,7 +1621,15 @@ index 0000000000..b6cba1d807
 + * transition. cgroup charging stays on the stock path.
 + *
 + * Recommended userspace configuration:
-+ *   - vm.swappiness = 1
++ *   - vm.swappiness: nothing to set.  Marie clamps its effective
++ *     swappiness to at most 1 in-kernel by default via low_swappiness_mode
++ *     (a /sys/kernel/mm/lru_marie/ knob that defaults on), so the higher
++ *     values udev rules, tuning daemons, or distro defaults install in
++ *     vm.swappiness are ignored by the reclaim pick driver.  (The clamp
++ *     only lowers, so a deliberate vm.swappiness=0 "never swap" is still
++ *     honoured.)  This is why CONFIG_LRU_MARIE=y no longer overrides the
++ *     vm_swappiness default.  The rationale for swappiness = 1 follows.
++ *
 + *     swappiness historically encoded the relative IO cost of swap
 + *     vs. filesystem paging, on the assumption that file cache and
 + *     anon working set carry comparable "hotness" distributions and
@@ -1663,12 +1672,14 @@ index 0000000000..b6cba1d807
 + *     zero throughout, because swappiness=1 short-circuits the
 + *     proportional update path.
 + *
-+ *     Higher values (s = 2..199) remain useful on slower-storage
-+ *     systems where the file refault cost is no longer negligible;
-+ *     Marie honours them via the stubborn proportional controller
-+ *     in marie_swap_bias_update. s = 0 is a hard "never swap" --
-+ *     reach OOM rather than touch anon. s = 200 is the symmetric
-+ *     "anon only" override. Both are intentional user policy
++ *     With low_swappiness_mode cleared, higher values (s = 2..199)
++ *     remain useful on slower-storage systems where the file refault
++ *     cost is no longer negligible; Marie honours them via the stubborn
++ *     proportional controller in marie_swap_bias_update. s = 0 is a
++ *     hard "never swap" -- reach OOM rather than touch anon (and, being
++ *     the low extreme, is honoured even with low_swappiness_mode on).
++ *     s = 200 is the symmetric "anon only" override, clamped to 1 while
++ *     low_swappiness_mode is on. All are intentional user policy
 + *     overrides; clean_min_ratio does not punch through them.
 + *   - systemd-oomd OFF
 + *     systemd-oomd reacts to PSI before Marie's clean_min_ratio
@@ -2365,6 +2376,50 @@ index 0000000000..b6cba1d807
 +static struct kobj_attribute marie_clean_min_ratio_attr =
 +	__ATTR_RW(clean_min_ratio);
 +
++/*
++ * low_swappiness_mode — clamp Marie's effective swappiness to at most 1
++ * (bool, default on). When set, the reclaim pick driver caps swappiness at 1
++ * (MARIE_PICK_FILE_THEN_ANON) regardless of the higher vm.swappiness /
++ * memory.swappiness values udev rules, tuning daemons, or distro defaults
++ * install. That is Marie's recommended policy (see the storage-tier rationale
++ * at the top of this file), so enforcing it in-kernel spares the operator from
++ * chasing down every writer. Default on => CONFIG_LRU_MARIE=y needs no
++ * swappiness config.
++ *
++ * It only LOWERS swappiness, never raises it, so the special "never swap"
++ * value 0 is preserved: an operator who set vm.swappiness=0 (OOM rather than
++ * touch anon) still gets 0 even with this mode on. Clear the knob to honour
++ * vm.swappiness verbatim (e.g. a higher proportional value on slow-storage
++ * systems where file refault cost is not negligible).
++ */
++unsigned int marie_low_swappiness_mode = 1;
++
++static ssize_t low_swappiness_mode_show(struct kobject *kobj,
++				       struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", READ_ONCE(marie_low_swappiness_mode));
++}
++
++static ssize_t low_swappiness_mode_store(struct kobject *kobj,
++					struct kobj_attribute *attr,
++					const char *buf, size_t count)
++{
++	unsigned int v;
++	int err = kstrtouint(buf, 10, &v);
++
++	if (err)
++		return err;
++	if (v > 1)
++		return -EINVAL;
++	WRITE_ONCE(marie_low_swappiness_mode, v);
++	/* Effective swappiness changed: restart the proportional controller. */
++	lru_marie_swappiness_changed();
++	return count;
++}
++
++static struct kobj_attribute marie_low_swappiness_mode_attr =
++	__ATTR_RW(low_swappiness_mode);
++
 +#ifdef CONFIG_SWAP
 +/*
 + * kcompmari sysfs knob: signed -100..+100, default +24.
@@ -2655,6 +2710,7 @@ index 0000000000..b6cba1d807
 +	&marie_version_attr.attr,
 +	&marie_stats_attr.attr,
 +	&marie_clean_min_ratio_attr.attr,
++	&marie_low_swappiness_mode_attr.attr,
 +#ifdef CONFIG_SWAP
 +	&marie_kcompmari_attr.attr,
 +#endif
@@ -3977,10 +4033,10 @@ index 0000000000..71f8eff7e5
 +SYM_FUNC_END(lru_marie_simd_scan_sse2)
 diff --git a/mm/lru_marie/state.c b/mm/lru_marie/state.c
 new file mode 100644
-index 0000000000..fc6e18da14
+index 0000000000..feb5c395b6
 --- /dev/null
 +++ b/mm/lru_marie/state.c
-@@ -0,0 +1,2832 @@
+@@ -0,0 +1,2844 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Marie per-PFN state array — allocation, init, and global counters.
@@ -5472,8 +5528,20 @@ index 0000000000..fc6e18da14
 +	 * call. mem_cgroup_swappiness returns the effective value (memcg own
 +	 * value on cgroup v1 non-root, vm_swappiness otherwise) and is
 +	 * a plain READ_ONCE under the hood.
++	 *
++	 * low_swappiness_mode (default on) clamps the effective value to at
++	 * most 1 (MARIE_PICK_FILE_THEN_ANON), Marie's recommended policy,
++	 * regardless of the higher values vm.swappiness / memory.swappiness
++	 * udev rules, tuning daemons, or distro defaults have installed. It
++	 * only ever LOWERS swappiness, so the special "never swap" value 0
++	 * (MARIE_PICK_FILE_STRICT: OOM rather than touch anon) is preserved --
++	 * an operator who deliberately set 0 still gets 0. Clear the knob to
++	 * honour the configured value verbatim. See the rationale at the top
++	 * of core.c.
 +	 */
-+	u8 swappiness = (u8)mem_cgroup_swappiness(memcg);
++	u8 configured = (u8)mem_cgroup_swappiness(memcg);
++	u8 swappiness = (READ_ONCE(marie_low_swappiness_mode) && configured > 1) ?
++			1 : configured;
 +	enum marie_pick_kind pick_kind;
 +	int type_order[2];
 +	int type_count;
@@ -7882,7 +7950,7 @@ index 0000000000..4d07cedd9c
 +#endif /* _MM_LRU_MARIE_STATE_COMPAT_H */
 diff --git a/mm/lru_marie/version.h b/mm/lru_marie/version.h
 new file mode 100644
-index 0000000000..4ef94f44bf
+index 0000000000..49dc67f1bd
 --- /dev/null
 +++ b/mm/lru_marie/version.h
 @@ -0,0 +1,22 @@
@@ -7905,7 +7973,7 @@ index 0000000000..4ef94f44bf
 +#define MARIE_PROGNAME	"Marie LRU"
 +#define MARIE_AUTHOR	"Masahito Suzuki"
 +
-+#define MARIE_VERSION	"0.6.6"
++#define MARIE_VERSION	"0.6.7"
 +
 +#endif /* _MM_LRU_MARIE_VERSION_H */
 diff --git a/mm/lru_marie/walker.c b/mm/lru_marie/walker.c
@@ -10014,7 +10082,7 @@ index ad2f121de9..6e5477f5ec 100644
  /* linux/mm/swap_state.c */
  /* One swap address space for each 64M swap space */
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index 0ceed77af0..b61734cdc0 100644
+index 0ceed77af0..ad522a373e 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
 @@ -39,6 +39,7 @@
@@ -10060,27 +10128,7 @@ index 0ceed77af0..b61734cdc0 100644
  #ifdef ARCH_HAS_PREFETCHW
  #define prefetchw_prev_lru_folio(_folio, _base, _field)			\
  	do {								\
-@@ -199,8 +228,19 @@ struct scan_control {
- 
- /*
-  * From 0 .. MAX_SWAPPINESS.  Higher means more swappy.
-+ *
-+ * CONFIG_LRU_MARIE=y: default 1. Under Marie's per-PFN reclaim
-+ * driver this maps to MARIE_PICK_FILE_THEN_ANON -- anon is fully
-+ * protected until clean_min_ratio is breached, matching the
-+ * ZRAM-era assumption that file pagecache is cheaper to refault
-+ * than anon is to swap. See the storage-tier rationale at the top
-+ * of mm/lru_marie/core.c.
-  */
-+#ifdef CONFIG_LRU_MARIE
-+int vm_swappiness = 1;
-+#else
- int vm_swappiness = 60;
-+#endif
- 
- #ifdef CONFIG_MEMCG
- 
-@@ -403,10 +443,16 @@ static unsigned long lruvec_lru_size(struct lruvec *lruvec, enum lru_list lru,
+@@ -403,10 +432,16 @@ static unsigned long lruvec_lru_size(struct lruvec *lruvec, enum lru_list lru,
  		if (!managed_zone(zone))
  			continue;
  
@@ -10099,7 +10147,7 @@ index 0ceed77af0..b61734cdc0 100644
  	}
  	return size;
  }
-@@ -459,6 +505,45 @@ static int reclaimer_offset(void)
+@@ -459,6 +494,45 @@ static int reclaimer_offset(void)
  	return PGSTEAL_DIRECT - PGSTEAL_KSWAPD;
  }
  
@@ -10145,7 +10193,7 @@ index 0ceed77af0..b61734cdc0 100644
  static inline int is_page_cache_freeable(struct folio *folio)
  {
  	/*
-@@ -880,14 +965,35 @@ static enum folio_references folio_check_references(struct folio *folio,
+@@ -880,14 +954,35 @@ static enum folio_references folio_check_references(struct folio *folio,
  		return FOLIOREF_ACTIVATE;
  
  	/*
@@ -10185,7 +10233,7 @@ index 0ceed77af0..b61734cdc0 100644
  	if (referenced_ptes) {
  		/*
  		 * All mapped folios start out with page table
-@@ -1044,9 +1150,13 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
+@@ -1044,9 +1139,13 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
  }
  
  /*
@@ -10201,7 +10249,7 @@ index 0ceed77af0..b61734cdc0 100644
  		struct pglist_data *pgdat, struct scan_control *sc,
  		struct reclaim_stat *stat, bool ignore_references)
  {
-@@ -1903,7 +2013,29 @@ static unsigned int move_folios_to_lru(struct lruvec *lruvec,
+@@ -1903,7 +2002,29 @@ static unsigned int move_folios_to_lru(struct lruvec *lruvec,
  		 * inhibits memcg migration).
  		 */
  		VM_BUG_ON_FOLIO(!folio_matches_lruvec(folio, lruvec), folio);
@@ -10232,7 +10280,7 @@ index 0ceed77af0..b61734cdc0 100644
  		nr_pages = folio_nr_pages(folio);
  		nr_moved += nr_pages;
  		if (folio_test_active(folio))
-@@ -5086,6 +5218,55 @@ static bool drain_evictable(struct lruvec *lruvec)
+@@ -5086,6 +5207,55 @@ static bool drain_evictable(struct lruvec *lruvec)
  	return true;
  }
  
@@ -10288,7 +10336,7 @@ index 0ceed77af0..b61734cdc0 100644
  static void lru_gen_change_state(bool enabled)
  {
  	static DEFINE_MUTEX(state_mutex);
-@@ -5604,7 +5785,15 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
+@@ -5604,7 +5774,15 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
  	struct lru_gen_mm_state *mm_state = get_mm_state(lruvec);
  
  	lrugen->max_seq = MIN_NR_GENS + 1;
@@ -10305,7 +10353,7 @@ index 0ceed77af0..b61734cdc0 100644
  
  	for (i = 0; i <= MIN_NR_GENS + 1; i++)
  		lrugen->timestamps[i] = jiffies;
-@@ -5702,7 +5891,23 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+@@ -5702,7 +5880,23 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
  	unsigned long nr_to_reclaim = sc->nr_to_reclaim;
  	bool proportional_reclaim;
  	struct blk_plug plug;
@@ -10329,7 +10377,7 @@ index 0ceed77af0..b61734cdc0 100644
  	if (lru_gen_enabled() && !root_reclaim(sc)) {
  		lru_gen_shrink_lruvec(lruvec, sc);
  		return;
-@@ -5710,6 +5915,29 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+@@ -5710,6 +5904,29 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
  
  	get_scan_count(lruvec, sc, nr);
  
@@ -10359,7 +10407,7 @@ index 0ceed77af0..b61734cdc0 100644
  	/* Record the original scan target for proportional adjustments later */
  	memcpy(targets, nr, sizeof(nr));
  
-@@ -5965,10 +6193,25 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+@@ -5965,10 +6182,25 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
  	struct lruvec *target_lruvec;
  	bool reclaimable = false;
  
@@ -10385,7 +10433,7 @@ index 0ceed77af0..b61734cdc0 100644
  
  	target_lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup, pgdat);
  
-@@ -6242,6 +6485,17 @@ static void snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat)
+@@ -6242,6 +6474,17 @@ static void snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat)
  	struct lruvec *target_lruvec;
  	unsigned long refaults;
  
@@ -10403,7 +10451,7 @@ index 0ceed77af0..b61734cdc0 100644
  	if (lru_gen_enabled())
  		return;
  
-@@ -6633,6 +6887,21 @@ static void kswapd_age_node(struct pglist_data *pgdat, struct scan_control *sc)
+@@ -6633,6 +6876,21 @@ static void kswapd_age_node(struct pglist_data *pgdat, struct scan_control *sc)
  	struct mem_cgroup *memcg;
  	struct lruvec *lruvec;
  
@@ -10425,7 +10473,7 @@ index 0ceed77af0..b61734cdc0 100644
  	if (lru_gen_enabled()) {
  		lru_gen_age_node(pgdat, sc);
  		return;
-@@ -7363,6 +7632,9 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
+@@ -7363,6 +7621,9 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
  void __meminit kswapd_run(int nid)
  {
  	pg_data_t *pgdat = NODE_DATA(nid);
@@ -10435,7 +10483,7 @@ index 0ceed77af0..b61734cdc0 100644
  
  	pgdat_kswapd_lock(pgdat);
  	if (!pgdat->kswapd) {
-@@ -7374,7 +7646,32 @@ void __meminit kswapd_run(int nid)
+@@ -7374,7 +7635,32 @@ void __meminit kswapd_run(int nid)
  			BUG_ON(system_state < SYSTEM_RUNNING);
  			pgdat->kswapd = NULL;
  		}
@@ -10468,7 +10516,7 @@ index 0ceed77af0..b61734cdc0 100644
  	pgdat_kswapd_unlock(pgdat);
  }
  
-@@ -7393,6 +7690,13 @@ void __meminit kswapd_stop(int nid)
+@@ -7393,6 +7679,13 @@ void __meminit kswapd_stop(int nid)
  		kthread_stop(kswapd);
  		pgdat->kswapd = NULL;
  	}
