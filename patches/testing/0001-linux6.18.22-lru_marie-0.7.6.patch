@@ -1,7 +1,7 @@
-From 86679447ea6920a1df47d8442849c4d4a7b31659 Mon Sep 17 00:00:00 2001
+From 819c30f9746c5db64ed36bfb81460e0069e95000 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Thu, 9 Jul 2026 16:11:08 +0900
-Subject: [PATCH] linux6.18.22-lru_marie-0.7.5
+Date: Fri, 10 Jul 2026 06:29:44 +0900
+Subject: [PATCH] linux6.18.22-lru_marie-0.7.6
 
 ---
  include/linux/lru_marie.h      |  493 ++++++
@@ -39,14 +39,14 @@ Subject: [PATCH] linux6.18.22-lru_marie-0.7.5
  mm/memcontrol-v1.c             |   11 +
  mm/memcontrol.c                |   13 +
  mm/mm_init.c                   |    3 +
- mm/oom_kill.c                  |   98 ++
+ mm/oom_kill.c                  |  213 +++
  mm/page_alloc.c                |  120 +-
  mm/page_io.c                   |  187 +++
  mm/rmap.c                      |    6 +
  mm/swap.c                      |  248 ++-
  mm/swap.h                      |    4 +
  mm/vmscan.c                    |  332 +++-
- 42 files changed, 10954 insertions(+), 27 deletions(-)
+ 42 files changed, 11069 insertions(+), 27 deletions(-)
  create mode 100644 include/linux/lru_marie.h
  create mode 100644 mm/lru_marie/Makefile
  create mode 100644 mm/lru_marie/account.h
@@ -9302,7 +9302,7 @@ index 0000000000..4d07cedd9c
 +#endif /* _MM_LRU_MARIE_STATE_COMPAT_H */
 diff --git a/mm/lru_marie/version.h b/mm/lru_marie/version.h
 new file mode 100644
-index 0000000000..eeb21b5072
+index 0000000000..431132bf59
 --- /dev/null
 +++ b/mm/lru_marie/version.h
 @@ -0,0 +1,22 @@
@@ -9325,7 +9325,7 @@ index 0000000000..eeb21b5072
 +#define MARIE_PROGNAME	"Marie LRU"
 +#define MARIE_AUTHOR	"Masahito Suzuki"
 +
-+#define MARIE_VERSION	"0.7.5"
++#define MARIE_VERSION	"0.7.6"
 +
 +#endif /* _MM_LRU_MARIE_VERSION_H */
 diff --git a/mm/lru_marie/walker.c b/mm/lru_marie/walker.c
@@ -10466,18 +10466,20 @@ index 7712d887b6..7bc5c1d657 100644
  
  	for (i = 0; i < NR_VMSCAN_THROTTLE; i++)
 diff --git a/mm/oom_kill.c b/mm/oom_kill.c
-index c145b0feec..2c932d8441 100644
+index c145b0feec..66c5264348 100644
 --- a/mm/oom_kill.c
 +++ b/mm/oom_kill.c
-@@ -45,6 +45,7 @@
+@@ -45,6 +45,9 @@
  #include <linux/mmu_notifier.h>
  #include <linux/cred.h>
  #include <linux/nmi.h>
 +#include <linux/vmstat.h>
++#include <linux/psi.h>
++#include <linux/math64.h>
  
  #include <asm/tlb.h>
  #include "internal.h"
-@@ -1270,3 +1271,100 @@ SYSCALL_DEFINE2(process_mrelease, int, pidfd, unsigned int, flags)
+@@ -1270,3 +1273,213 @@ SYSCALL_DEFINE2(process_mrelease, int, pidfd, unsigned int, flags)
  	return -ENOSYS;
  #endif /* CONFIG_MMU */
  }
@@ -10511,60 +10513,173 @@ index c145b0feec..2c932d8441 100644
 + * backs off before re-arming so one kill gets a chance to drain the storm.
 + */
 +#define THRASH_WD_INTERVAL	(2 * HZ)
-+#define THRASH_WD_WINDOWS	8	/* 16s of sustained treadmill */
++#define THRASH_WD_WINDOWS	8	/* 16s: refault-ratio path (PSI off) */
 +#define THRASH_WD_BACKOFF	30	/* 60s hold-off after firing */
++
++#ifdef CONFIG_PSI
++/*
++ * Direct-signal path, used when PSI is runtime-enabled. The treadmill's
++ * defining symptom is that userspace constantly stalls on memory; PSI measures
++ * that directly. Fire when the box spends >= THRASH_WD_PSI_PCT of wall-clock
++ * with at least one task stalled on memory ("some") over THRASH_WD_PSI_WINDOWS
++ * windows. "some" rather than "full": on a many-core box some cores keep doing
++ * non-memory work even while the desktop is unusable, so "full" (every task
++ * stalled) under-reads. Two independent confirmations (this AND free <= 2*high)
++ * let the window be shorter than a PSI-only killer's (systemd-oomd 30s /
++ * facebook oomd 15s), which have no free-headroom cross-check.
++ */
++#define THRASH_WD_PSI_WINDOWS	5			/* 10s sustained */
++#define THRASH_WD_PSI_PCT	80
++#define THRASH_WD_WINDOW_NS	((u64)(THRASH_WD_INTERVAL / HZ) * NSEC_PER_SEC)
++#endif
 +
 +static void thrash_wd_fn(struct work_struct *work);
 +static DECLARE_DELAYED_WORK(thrash_wd_work, thrash_wd_fn);
++
++/*
++ * Memory-pressure gate for the treadmill detector.
++ *
++ * The livelock this watchdog exists for is defined by reclaim being unable to
++ * build any free headroom: free memory stays pinned near the watermarks while
++ * both CPUs churn compression/decompression and every userspace touch waits
++ * behind the storm. The steal+refault ratio alone does not distinguish that
++ * from a merely busy large-RAM box, where a heavy but healthy workload (game
++ * download, build, browser) streams page cache -- and, under lru_marie/MGLRU
++ * proactive reclaim, racks up high steal+refault counts -- while gigabytes
++ * stay free. Firing there is a false positive: with free far above the high
++ * watermark no allocation is anywhere near the OOM path, so killing a task is
++ * pure collateral damage.
++ *
++ * Only arm the detector when the system genuinely cannot keep free above its
++ * high watermark. In a real treadmill free oscillates between min and high
++ * (kswapd stops reclaiming at high, allocations immediately eat back down), so
++ * free never climbs to a multiple of high; requiring free <= 2 * high keeps
++ * the original 8G zram repro firing while suppressing the large-RAM churn case
++ * (free measured >= ~4x high in every false-positive dump). Summed globally to
++ * match the global steal/refault counters above.
++ */
++static bool thrash_wd_mem_pressured(void)
++{
++	struct zone *zone;
++	unsigned long free = 0, high = 0;
++
++	for_each_populated_zone(zone) {
++		if (!managed_zone(zone))
++			continue;
++		free += zone_page_state(zone, NR_FREE_PAGES);
++		high += high_wmark_pages(zone);
++	}
++
++	return free <= high * 2;
++}
 +
 +static void thrash_wd_fn(struct work_struct *work)
 +{
 +	static unsigned long last_refaults, last_steals;
 +	static unsigned int hot_windows, backoff;
-+	unsigned long ev[NR_VM_EVENT_ITEMS];
-+	unsigned long refaults, steals, dr, ds;
++#ifdef CONFIG_PSI
++	static u64 psi_ring[THRASH_WD_PSI_WINDOWS];
++	static unsigned int psi_cursor, psi_filled;
++#endif
++	bool fire = false;
++	char reason[80];
 +
 +	if (backoff) {
 +		backoff--;
 +		goto resched;
 +	}
 +
-+	all_vm_events(ev);
-+	steals = ev[PGSTEAL_KSWAPD] + ev[PGSTEAL_DIRECT] +
-+		 ev[PGSTEAL_KHUGEPAGED];
-+	refaults = global_node_page_state(WORKINGSET_REFAULT_ANON) +
-+		   global_node_page_state(WORKINGSET_REFAULT_FILE);
++#ifdef CONFIG_PSI
++	if (!static_branch_likely(&psi_disabled)) {
++		/*
++		 * Direct path: PSI memory-"some" is the ns of wall-clock during
++		 * which at least one task was stalled on memory (reclaim /
++		 * refault / swapin). Compare the stall accumulated over the last
++		 * THRASH_WD_PSI_WINDOWS windows against that span: a ring of the
++		 * per-window totals makes this robust to the ~2s PSI aggregation
++		 * cadence drifting against our timer. Still gated on real memory
++		 * pressure so an abundant-free box is never touched.
++		 */
++		u64 some = psi_system.total[PSI_AVGS][PSI_MEM_SOME];
++		u64 oldest = psi_ring[psi_cursor];
 +
-+	dr = refaults - last_refaults;
-+	ds = steals - last_steals;
-+	last_refaults = refaults;
-+	last_steals = steals;
++		psi_ring[psi_cursor] = some;
++		psi_cursor = (psi_cursor + 1) % THRASH_WD_PSI_WINDOWS;
 +
-+	/*
-+	 * Storm volume: reclaim moving >= totalram/512 pages per window
-+	 * (~8MB/s per 8G RAM). Treadmill ratio: at least half of it faults
-+	 * straight back as recently-evicted working set.
-+	 */
-+	if (ds >= totalram_pages() / 512 && dr * 2 >= ds)
-+		hot_windows++;
-+	else
-+		hot_windows = 0;
++		if (psi_filled < THRASH_WD_PSI_WINDOWS) {
++			psi_filled++;		/* warming the ring */
++		} else if (thrash_wd_mem_pressured() &&
++			   some - oldest >= THRASH_WD_WINDOW_NS *
++					    THRASH_WD_PSI_WINDOWS *
++					    THRASH_WD_PSI_PCT / 100) {
++			unsigned long stall_ms = div_u64(some - oldest,
++							 NSEC_PER_MSEC);
 +
-+	if (hot_windows >= THRASH_WD_WINDOWS) {
++			scnprintf(reason, sizeof(reason),
++				  "PSI mem-some stalled %lums/%ums",
++				  stall_ms, (unsigned int)(THRASH_WD_PSI_WINDOWS *
++				  (THRASH_WD_INTERVAL / HZ) * 1000));
++			fire = true;
++		}
++	} else
++#endif
++	{
++		/*
++		 * Fallback (PSI compiled out or runtime-disabled): infer the
++		 * treadmill from vm counters. Storm volume: reclaim moving >=
++		 * totalram/512 pages per window (~8MB/s per 8G RAM). Treadmill
++		 * ratio: at least half of it faults straight back as recently-
++		 * evicted working set. Gate on real memory pressure (free pinned
++		 * near the watermarks) so a busy-but-healthy large-RAM box
++		 * streaming page cache with gigabytes free is not mistaken for a
++		 * livelock -- see thrash_wd_mem_pressured().
++		 */
++		unsigned long ev[NR_VM_EVENT_ITEMS];
++		unsigned long refaults, steals, dr, ds;
++
++		all_vm_events(ev);
++		steals = ev[PGSTEAL_KSWAPD] + ev[PGSTEAL_DIRECT] +
++			 ev[PGSTEAL_KHUGEPAGED];
++		refaults = global_node_page_state(WORKINGSET_REFAULT_ANON) +
++			   global_node_page_state(WORKINGSET_REFAULT_FILE);
++
++		dr = refaults - last_refaults;
++		ds = steals - last_steals;
++		last_refaults = refaults;
++		last_steals = steals;
++
++		if (ds >= totalram_pages() / 512 && dr * 2 >= ds &&
++		    thrash_wd_mem_pressured())
++			hot_windows++;
++		else
++			hot_windows = 0;
++
++		if (hot_windows >= THRASH_WD_WINDOWS) {
++			scnprintf(reason, sizeof(reason),
++				  "refault %lu vs %lu steals, %us sustained",
++				  dr, ds, (unsigned int)(THRASH_WD_WINDOWS *
++				  (THRASH_WD_INTERVAL / HZ)));
++			fire = true;
++		}
++	}
++
++	if (fire) {
 +		struct oom_control oc = {
 +			.zonelist = node_zonelist(first_memory_node, GFP_KERNEL),
 +			.gfp_mask = GFP_KERNEL,	/* !__GFP_FS shortcuts out_of_memory */
 +			.order = -1,
 +		};
 +
-+		pr_warn("thrash livelock: %lu refaults vs %lu steals over last window (%us sustained), invoking OOM\n",
-+			dr, ds, THRASH_WD_WINDOWS * (THRASH_WD_INTERVAL / HZ));
++		pr_warn("thrash livelock: %s, invoking OOM\n", reason);
 +		if (mutex_trylock(&oom_lock)) {
 +			out_of_memory(&oc);
 +			mutex_unlock(&oom_lock);
 +		}
 +		hot_windows = 0;
 +		backoff = THRASH_WD_BACKOFF;
++#ifdef CONFIG_PSI
++		psi_filled = 0;		/* re-warm after the backoff gap */
++#endif
 +	}
 +
 +resched:
