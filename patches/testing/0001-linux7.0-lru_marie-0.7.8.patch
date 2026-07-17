@@ -1,7 +1,7 @@
 From aa78c519a3f99a5181a805b4233430ca2798775a Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
 Date: Mon, 13 Jul 2026 01:28:36 +0900
-Subject: [PATCH] linux7.0-lru_marie-0.7.7
+Subject: [PATCH] linux7.0-lru_marie-0.7.8
 
 ---
  include/linux/lru_marie.h      |  493 ++++++
@@ -30,7 +30,7 @@ Subject: [PATCH] linux7.0-lru_marie-0.7.7
  mm/lru_marie/simd_x86_avx2.S   |  152 ++
  mm/lru_marie/simd_x86_avx512.S |  199 +++
  mm/lru_marie/simd_x86_sse2.S   |  158 ++
- mm/lru_marie/state.c           | 3014 ++++++++++++++++++++++++++++++++
+ mm/lru_marie/state.c           | 3013 ++++++++++++++++++++++++++++++++
  mm/lru_marie/state.h           |  987 +++++++++++
  mm/lru_marie/state_compat.h    |   94 +
  mm/lru_marie/version.h         |   22 +
@@ -46,7 +46,7 @@ Subject: [PATCH] linux7.0-lru_marie-0.7.7
  mm/swap.c                      |  248 ++-
  mm/swap.h                      |    4 +
  mm/vmscan.c                    |  331 +++-
- 42 files changed, 11366 insertions(+), 27 deletions(-)
+ 42 files changed, 11365 insertions(+), 27 deletions(-)
  create mode 100644 include/linux/lru_marie.h
  create mode 100644 mm/lru_marie/Makefile
  create mode 100644 mm/lru_marie/account.h
@@ -246,7 +246,7 @@ index 0000000000..fc30269822
 + * to enter the buddy allocator. When marie_state[pfn] still carries
 + * TRACKED -- which happens whenever the reclaim isolate path
 + * (marie_evict_counters_only) decremented counters but intentionally
-+ * preserved the state byte so install_local's TRACKED early-out kept
++ * preserved the state byte so marie_folio_install's TRACKED early-out kept
 + * blocking concurrent installs during shrink_folio_list -- this wipes
 + * the byte, the global (type, gen, tier) bitmap bit, and the
 + * gen_occupied slot in one lock-free pass.
@@ -1663,7 +1663,7 @@ index 0000000000..e2feeee275
 + *     no per-(lru, zone) shadow counter to bounce
 + *   - per-pgdat walker driven from kswapd, with rmap-fed bloom
 + *     feedback so PMD scans concentrate on hot regions
-+ *   - single global cycling per-type gen clock (MARIE_PFN_NR_GENS = 4)
++ *   - single global cycling per-type gen clock (MARIE_PFN_NR_GENS = 8)
 + *     encoded in the per-PFN byte, advanced by global install cadence
 + *     (marie_folio_install counts installs onto the head gen and
 + *     advances at marie_gen_growth_live[type])
@@ -1869,14 +1869,14 @@ index 0000000000..e2feeee275
 + *   - lru_marie_add_folio always lands on the current head gen
 + *     (atomic_read(&marie_head_gen[type])).
 + *   - marie_state_isolate_scan_l2lock always pulls from the oldest
-+ *     occupied gen (marie_find_oldest_occupied).
++ *     occupied gen (marie_find_oldest_occupied_mlv).
 + *   - shrink_folio_list classifies each isolated folio:
 + *       FOLIOREF_RECLAIM  → freed (this folio truly was cold)
 + *       FOLIOREF_KEEP     → returned in folio_list, putback re-routes
 + *       FOLIOREF_ACTIVATE → ditto, with PG_active set
-+ *     putback re-installs the survivor at (oldest+1)&3 with
++ *     putback re-installs the survivor at (oldest+1)&7 with
 + *     target_tier = max(prev_tier, w_tier) via
-+ *     marie_install_at_gen.
++ *     marie_state_publish_at_gen.
 + *   - head_gen advances per type via marie_try_advance_head_mlv (the
 + *     _mlv suffix is historical -- the clock is a single global one per
 + *     type), fired by global install cadence alone (marie_folio_install
@@ -5395,7 +5395,7 @@ new file mode 100644
 index 0000000000..4acf8318d6
 --- /dev/null
 +++ b/mm/lru_marie/state.c
-@@ -0,0 +1,3014 @@
+@@ -0,0 +1,3013 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Marie per-PFN state array — allocation, init, and global counters.
@@ -6235,7 +6235,7 @@ index 0000000000..4acf8318d6
 + * between marie_evict_counters_only (counters -1, TRACKED preserved) and
 + * the next allocation at the same PFN: the moment the page is destined
 + * for buddy, we wipe Marie's per-PFN bookkeeping so a subsequent
-+ * install_local starts from a clean state byte.
++ * marie_folio_install starts from a clean state byte.
 + *
 + * Counters are NOT touched here -- they were either already balanced
 + * by marie_evict_locked (the normal Marie del path) or pre-decremented
@@ -6458,9 +6458,9 @@ index 0000000000..4acf8318d6
 + * encodes (target_gen, target_tier).
 + *
 + * Called from:
-+ *   marie_state_inc_tier saturate path (target_gen=head, target_tier=0)
-+ *   shrink_lruvec residue putback (target_gen=(head+2)&3,
-+ *                                  target_tier=max(prev, w_tier))
++ *   marie_folio_demote / lru_marie_lazyfree (MADV_COLD / MADV_FREE),
++ *   both as (target_gen=oldest, target_tier=0). The tier-saturate
++ *   roll is open-coded inline in __marie_state_inc_tier instead.
 + */
 +void marie_state_move_to_gen(unsigned long pfn,
 +			     u8 target_gen, u8 target_tier)
@@ -6791,7 +6791,7 @@ index 0000000000..4acf8318d6
 +			    unsigned long nr_reclaimed,
 +			    u8 swappiness)
 +{
-+	s64 cur, delta;
++	s64 delta;
 +
 +	/*
 +	 * Special values bypass the controller. The pick path does not
@@ -6817,8 +6817,7 @@ index 0000000000..4acf8318d6
 +	else
 +		delta = +(s64)nr_reclaimed * (s64)swappiness;
 +
-+	cur = atomic64_read(&marie_swap_bias);
-+	atomic64_set(&marie_swap_bias, cur + delta);
++	atomic64_add(delta, &marie_swap_bias);
 +}
 +
 +/*
@@ -6993,7 +6992,7 @@ index 0000000000..4acf8318d6
 + * reclaim-driven trigger, fired ONLY on true exhaustion (the retired
 + * unconditional "occupied < 2 at entry" form thrashed the ring). Without
 + * demand-pull a workload that stops installing a type strands its
-+ * head-gen pages, since marie_find_oldest_occupied skips head (the
++ * head-gen pages, since marie_find_oldest_occupied_mlv skips head (the
 + * install destination).
 + *
 + * Per (type, tier) the scan walks the per-(gen, type) bitmap, claims
@@ -7001,7 +7000,7 @@ index 0000000000..4acf8318d6
 + * marie_evict_counters_only: counters decremented and the scan-bitmap
 + * slot + gen_occupied retired at isolate (so other CPUs stop re-finding
 + * the in-flight folio), but the per-PFN TRACKED byte is KEPT so
-+ * install_local's early-out blocks a concurrent install from re-setting
++ * marie_folio_install's early-out blocks a concurrent install from re-setting
 + * PG_lru while shrink_folio_list reclaims it.
 + *
 + * Teardown of the TRACKED byte is deferred: a reclaimed folio is wiped
@@ -7443,7 +7442,7 @@ index 0000000000..4acf8318d6
 +					 * counters AND retires the scan-bitmap
 +					 * slot (so other CPUs stop re-finding
 +					 * this in-flight folio), but KEEPS the
-+					 * TRACKED byte so install_local's early-
++					 * TRACKED byte so marie_folio_install's early-
 +					 * out blocks any concurrent install from
 +					 * re-setting PG_lru while shrink_folio_-
 +					 * list reclaims it. The TRACKED byte is
@@ -8111,7 +8110,7 @@ index 0000000000..4acf8318d6
 + *   1. folio_try_get()        - reference held, folio cannot be freed.
 + *   2. folio_test_clear_lru() - PG_lru cleared atomically, gating
 + *                                external del paths.
-+ *   3. install_local TRACKED early-out (above)
++ *   3. marie_folio_install TRACKED early-out (above)
 + *
 + * memcg_bitmap is cleared here because the buddy free hook
 + * (marie_state_drop_pfn_at_free) runs without a folio reference and cannot
@@ -8768,7 +8767,7 @@ index 0000000000..585bea9c8e
 +/*
 + * clean_min_ratio: minimum file-pagecache reserve as percent of
 + * node_present_pages. Sysfs-tunable in core.c, read by reclaim.
-+ * Default 15 (le9uo recommendation for desktop).
++ * Default 10.
 + */
 +extern unsigned int marie_clean_min_ratio;
 +
@@ -8918,11 +8917,11 @@ index 0000000000..585bea9c8e
 + * counter updates on both source and destination (gen, type) planes.
 + *
 + * Single point of policy for any operation that needs to move a folio
-+ * between gens. Two callers in design.h:
-+ *   - walker tier saturate (section 7):
-+ *       marie_state_move_to_gen(pfn, head, 0)
-+ *   - shrink_folio_list residue putback (section 13):
-+ *       marie_state_move_to_gen(pfn, (head + 2) & 3, max(prev, w))
++ * between gens. Callers (all in state.c):
++ *   - MADV_COLD demote (marie_folio_demote):
++ *       marie_state_move_to_gen(pfn, oldest, 0)
++ *   - MADV_FREE (lru_marie_lazyfree): same (pfn, oldest, 0) form.
++ *     (The reclaim putback now uses marie_state_publish_at_gen.)
 + *
 + * The state-byte cmpxchg defeats races against del / another
 + * concurrent move. The bitmap / counter shuffle uses "new first, then
@@ -8940,9 +8939,9 @@ index 0000000000..585bea9c8e
 + * marie_state_drop_pfn - wipe every per-PFN tracking artifact
 + * (state byte, (type, gen, tier) L1 bit, occupancy counter, global
 + * L2 range counter with bulk L2 clear on 0) for @folio. Shared by the
-+ * normal evict path (marie_evict_locked) and the enable=0 drain path
-+ * (marie_drain_one_lruvec) so disable->enable cycles never leave
-+ * ghost per-PFN state behind. No-op when the byte is not TRACKED.
++ * normal evict path (marie_evict_locked) -- the runtime enable=0
++ * drain that used to share it was removed together with the boot-only
++ * static key. No-op when the byte is not TRACKED.
 + */
 +void marie_state_drop_pfn(struct folio *folio);
 +
@@ -9308,14 +9307,14 @@ index 0000000000..585bea9c8e
 + * ---------------------------------------------------------------------
 + *
 + * No promote-queue or per-CPU staging drain remains: every install /
-+ * evict / tier bump is synchronous (install_local / install_locked
-+ * publish per-PFN state inline, evict_locked wipes it inline,
-+ * marie_state_inc_tier handles saturation via marie_state_move_to_gen
-+ * directly).
++ * evict / tier bump is synchronous (marie_folio_install publishes
++ * per-PFN state inline, marie_evict_locked wipes it inline,
++ * marie_state_inc_tier handles saturation via an inline gen roll in
++ * __marie_state_inc_tier).
 + *
-+ * The remaining drain entry, marie_drain_one_lruvec (in core.c), is
-+ * only the enable/disable transition: it walks the per-(type, gen,
-+ * tier) bitmap and hands every TRACKED folio back to the legacy LRU.
++ * No enable/disable drain entry remains either: Marie is selected
++ * once at boot via the lru_marie= static key, before any folio is
++ * tracked, so there is nothing to hand back to the legacy LRU.
 + */
 +
 +/*
@@ -9528,7 +9527,7 @@ index 0000000000..8edb82807a
 +#define MARIE_PROGNAME	"Marie LRU"
 +#define MARIE_AUTHOR	"Masahito Suzuki"
 +
-+#define MARIE_VERSION	"0.7.7"
++#define MARIE_VERSION	"0.7.8"
 +
 +#endif /* _MM_LRU_MARIE_VERSION_H */
 diff --git a/mm/lru_marie/walker.c b/mm/lru_marie/walker.c
@@ -11025,7 +11024,7 @@ index 2d4b6f1a55..daa2311ace 100644
 +	/*
 +	 * Wipe Marie's per-PFN state at the buddy handoff. Marie's reclaim
 +	 * isolate path intentionally leaves marie_state[pfn]'s TRACKED bit
-+	 * set across shrink_folio_list (so install_local's TRACKED early-
++	 * set across shrink_folio_list (so marie_folio_install's TRACKED early-
 +	 * out keeps blocking concurrent installs on the in-flight folio);
 +	 * this hook is the canonical point at which that stale bit must
 +	 * disappear so the next allocation at this PFN starts clean. No-op
