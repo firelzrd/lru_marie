@@ -1,56 +1,10 @@
-From cbe73c5e20d6d616592c130f9e4820dbd1708088 Mon Sep 17 00:00:00 2001
+From 0cd322ef5bdbad0ea67365ea6ce2d0a1ccfd3e2e Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Thu, 16 Jul 2026 16:27:15 +0900
-Subject: [PATCH] linux6.16.12-lru_marie-0.7.7
+Date: Sat, 18 Jul 2026 17:16:52 +0900
+Subject: [PATCH] linux6.16.12-lru_marie-0.7.8
 
-Port Marie LRU v0.7.7 to Linux 6.16.y. Based on the 6.18 patch (the
-superset core: concede_pressure_mode + thrash_wd_mode knobs) with the
-integration hunks rebased onto 6.16, since 6.16 sits between the 6.12
-and 6.18 targets and matches neither cleanly.
-
-New files (mm/lru_marie/*, include/linux/lru_marie.h) taken verbatim
-from the 6.18 patch; the LINUX_VERSION_CODE compat headers already cover
-6.16 for folio->flags (memdesc, 6.18), folio_pte_batch (9-arg, <6.18),
-lazy_mmu (<7.0), test_and_clear_young_ptes_notify (<7.1) and the
-PGSTEAL/PGSCAN vm_event vs node_stat split (<7.1).
-
-6.16-specific fixups vs the 6.18 patch:
-
-- mm/lru_marie/state_compat.h: shrink_folio_list() gained its trailing
-  @memcg parameter as of 6.16 (not 6.18 as the comment claimed), so the
-  marie_shrink_folio_list() wrapper boundary is lowered to >= 6.16.
-  Without this it calls the 5-arg form and fails to compile on 6.16.
-
-- mm/page_io.c: 6.16's swap-writeback entry is
-  swap_writeout(struct folio *, struct writeback_control *wbc) -- the
-  folio conversion landed in 6.16 but the swap_iocb **swap_plug
-  signature only in 6.17. kcompressd/do_swapout/kcompressd_store are
-  taken in their wbc form (from the 6.12 patch) and hooked into
-  swap_writeout; swp_swap_info() (not __swap_entry_to_info()).
-
-- mm/oom_kill.c thrash watchdog: on 6.16 PGSTEAL_{KSWAPD,DIRECT,
-  KHUGEPAGED} are enum vm_event_item (they relocate to node_stat_item
-  in 7.1), so the Marie fast path reads them via all_vm_events() like
-  the PSI-off fallback instead of global_node_page_state(), which would
-  index the wrong array. (WORKINGSET_REFAULT_* are already node_stat.)
-
-- include/linux/mmzone.h (int kswapd_failures), memcontrol.h
-  (mem_cgroup_handle_over_high, no __ prefix), mm/internal.h (no
-  user_proactive_reclaim, memcg-form shrink_folio_list decl) and
-  mm/swap.h (swap_writeout wbc decl) rebased to the 6.16 context.
-
-Everything else (vmscan.c, swap.c, huge_memory.c, memcontrol.c, oom
-sysctl table, mm/Makefile, page_alloc free hook) matched 6.16 directly.
-
-Build: CONFIG_LRU_MARIE=y + CONFIG_LRU_MARIE_DEFRAG=y, x86_64, gcc 13.4;
-mm/ and vmlinux link clean. Only a config-specific frame-size lint in
-thrash_wd_fn (all_vm_events scratch, ~1.1 KiB > CONFIG_FRAME_WARN=1024;
-no warning at the upstream 2048 default), matching the existing ~1.5 KiB
-lint in marie_state_shrink_lruvec.
-
-Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 ---
- include/linux/lru_marie.h      |  493 +++++++
+ include/linux/lru_marie.h      |  493 ++++++
  include/linux/memcontrol.h     |   26 +-
  include/linux/mm_inline.h      |  103 +-
  include/linux/mmzone.h         |   16 +
@@ -64,35 +18,58 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  mm/lru_marie/account.h         |  106 ++
  mm/lru_marie/bitmap.c          |  118 ++
  mm/lru_marie/bitmap.h          |  221 +++
- mm/lru_marie/core.c            | 1268 +++++++++++++++++
- mm/lru_marie/defrag.c          | 1088 +++++++++++++++
- mm/lru_marie/defrag.h          |   85 ++
+ mm/lru_marie/core.c            | 1268 ++++++++++++++
+ mm/lru_marie/defrag.c          | 1088 ++++++++++++
+ mm/lru_marie/defrag.h          |   85 +
  mm/lru_marie/defrag_compat.h   |   53 +
  mm/lru_marie/pfn_install.h     |  139 ++
  mm/lru_marie/prefetch.h        |  111 ++
  mm/lru_marie/simd.h            |  109 ++
  mm/lru_marie/simd_generic.c    |   46 +
- mm/lru_marie/simd_x86.c        |  271 ++++
- mm/lru_marie/simd_x86_avx2.S   |  152 ++
- mm/lru_marie/simd_x86_avx512.S |  199 +++
- mm/lru_marie/simd_x86_sse2.S   |  158 +++
- mm/lru_marie/state.c           | 3014 ++++++++++++++++++++++++++++++++++++++++
- mm/lru_marie/state.h           |  987 +++++++++++++
+ mm/lru_marie/simd_x86.c        |  271 +++
+ mm/lru_marie/simd_x86_avx2.S   |  170 ++
+ mm/lru_marie/simd_x86_avx512.S |  220 +++
+ mm/lru_marie/simd_x86_sse2.S   |  158 ++
+ mm/lru_marie/state.c           | 3014 ++++++++++++++++++++++++++++++++
+ mm/lru_marie/state.h           |  987 +++++++++++
  mm/lru_marie/state_compat.h    |  101 ++
  mm/lru_marie/version.h         |   22 +
- mm/lru_marie/walker.c          |  969 +++++++++++++
- mm/lru_marie/walker_compat.h   |   82 ++
+ mm/lru_marie/walker.c          |  969 ++++++++++
+ mm/lru_marie/walker_compat.h   |   82 +
  mm/memcontrol-v1.c             |   11 +
  mm/memcontrol.c                |   13 +
  mm/mm_init.c                   |    3 +
- mm/oom_kill.c                  |  317 +++++
+ mm/oom_kill.c                  |  335 ++++
  mm/page_alloc.c                |  120 +-
- mm/page_io.c                   |  191 +++
+ mm/page_io.c                   |  191 ++
  mm/rmap.c                      |    6 +
- mm/swap.c                      |  248 +++-
+ mm/swap.c                      |  248 ++-
  mm/swap.h                      |    4 +
- mm/vmscan.c                    |  332 ++++-
- 42 files changed, 11387 insertions(+), 27 deletions(-)
+ mm/vmscan.c                    |  332 +++-
+ 42 files changed, 11444 insertions(+), 27 deletions(-)
+ create mode 100644 include/linux/lru_marie.h
+ create mode 100644 mm/lru_marie/Makefile
+ create mode 100644 mm/lru_marie/account.h
+ create mode 100644 mm/lru_marie/bitmap.c
+ create mode 100644 mm/lru_marie/bitmap.h
+ create mode 100644 mm/lru_marie/core.c
+ create mode 100644 mm/lru_marie/defrag.c
+ create mode 100644 mm/lru_marie/defrag.h
+ create mode 100644 mm/lru_marie/defrag_compat.h
+ create mode 100644 mm/lru_marie/pfn_install.h
+ create mode 100644 mm/lru_marie/prefetch.h
+ create mode 100644 mm/lru_marie/simd.h
+ create mode 100644 mm/lru_marie/simd_generic.c
+ create mode 100644 mm/lru_marie/simd_x86.c
+ create mode 100644 mm/lru_marie/simd_x86_avx2.S
+ create mode 100644 mm/lru_marie/simd_x86_avx512.S
+ create mode 100644 mm/lru_marie/simd_x86_sse2.S
+ create mode 100644 mm/lru_marie/state.c
+ create mode 100644 mm/lru_marie/state.h
+ create mode 100644 mm/lru_marie/state_compat.h
+ create mode 100644 mm/lru_marie/version.h
+ create mode 100644 mm/lru_marie/walker.c
+ create mode 100644 mm/lru_marie/walker_compat.h
 
 diff --git a/include/linux/lru_marie.h b/include/linux/lru_marie.h
 new file mode 100644
@@ -4888,10 +4865,10 @@ index 0000000000..44ab48fa0b
 +EXPORT_SYMBOL_GPL(lru_marie_simd_young_pte_mask);
 diff --git a/mm/lru_marie/simd_x86_avx2.S b/mm/lru_marie/simd_x86_avx2.S
 new file mode 100644
-index 0000000000..23c28d3996
+index 0000000000..c14e534b0e
 --- /dev/null
 +++ b/mm/lru_marie/simd_x86_avx2.S
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,170 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * mm/lru_marie/simd_x86_avx2.S -- AVX2 PTE young-bit scan for Marie walker.
@@ -4938,10 +4915,12 @@ index 0000000000..23c28d3996
 + *   rdi   = current PTE pointer (walks forward by 32 bytes per inner iter)
 + *   rsi   = bitmap base (constant)
 + *   rdx   = outer loop counter (8 -> 0)
-+ *   rcx   = inner loop counter (16 -> 0)
++ *   rcx   = bit-position counter within current ulong (steps of 4, 0..60);
++ *           cl is directly the shlq shift count, so no register move and no
++ *           push/pop-around-shlq are needed
 + *   rax   = vmovmskpd result (4-bit young mask) / shift scratch
 + *   r8    = per-ulong accumulator
-+ *   r9    = bit-position counter within current ulong (steps of 4, 0..60)
++ *   r10   = inner loop counter (16 -> 0)
 + *   r11   = bitmap write pointer (rsi + outer*8, updated each outer iter)
 + *
 + * AVX2 only (no AVX-512 zmm/kmask/opmask):
@@ -4975,9 +4954,10 @@ index 0000000000..23c28d3996
 +	 * Outer loop: one iteration per output ulong (64 PTEs / 8 words).
 +	 */
 +.Louter_avx2:
-+	xorq	%r8, %r8		/* accumulator = 0                  */
-+	xorq	%r9, %r9		/* bit-position = 0                 */
-+	movl	$16, %ecx		/* inner counter: 16 SIMD iters     */
++	xorq	%r8, %r8		/* accumulator A = 0                */
++	xorq	%r9, %r9		/* accumulator B = 0 (split chain)  */
++	xorq	%rcx, %rcx		/* bit-position = 0 (cl = shift cnt)*/
++	movl	$8, %r10d		/* inner counter: 8 x 2 unrolled    */
 +
 +	/*
 +	 * Inner loop: one iteration processes 4 PTEs => 4 result bits.
@@ -4986,9 +4966,13 @@ index 0000000000..23c28d3996
 +	 * rdi advances by 32 bytes per inner iteration.
 +	 */
 +.Linner_avx2:
-+	/* Load 4 PTEs into ymm1 (unaligned; caller guarantees 8-byte align). */
-+	vmovdqu	(%rdi), %ymm1		/* ymm1 = { pte3 | pte2 | pte1 | pte0 } */
-+	addq	$32, %rdi
++	/*
++	 * DUAL-LOAD: both 4-PTE loads (ymm1, ymm2) up front for memory-level
++	 * parallelism, then shift+extract both, then merge A->r8 / B->r9.
++	 */
++	vmovdqu	0(%rdi), %ymm1		/* block A: { pte3..pte0 } */
++	vmovdqu	32(%rdi), %ymm2		/* block B: { pte7..pte4 } */
++	addq	$64, %rdi
 +
 +	/*
 +	 * Shift each 64-bit PTE lane left by 58 so the young bit (bit 5 =
@@ -4998,7 +4982,8 @@ index 0000000000..23c28d3996
 +	 * is possible: only the original bit 5 can reach bit 63 (every other
 +	 * bit shifts past it or stays below it).
 +	 */
-+	vpsllq	$58, %ymm1, %ymm1	/* bit5 -> bit63 (sign) per lane   */
++	vpsllq	$58, %ymm1, %ymm1	/* block A: bit5 -> bit63          */
++	vpsllq	$58, %ymm2, %ymm2	/* block B: bit5 -> bit63          */
 +
 +	/*
 +	 * VMOVMSKPD: extract the sign bit (bit 63) of each of the 4 packed
@@ -5018,22 +5003,32 @@ index 0000000000..23c28d3996
 +	vmovmskpd %ymm1, %eax		/* eax[3:0] = 4 young bits, one/PTE  */
 +
 +	/*
-+	 * Place the 4-bit group at bit-position r9 (0, 4, 8, ..., 60) in the
-+	 * 64-bit accumulator.  CL-shift idiom: borrow rcx (inner counter)
-+	 * around the single variable shift, then advance r9 by the 4 PTEs
-+	 * consumed this iteration.
++	 * Place the 4-bit group at bit-position rcx (0, 4, 8, ..., 60) in the
++	 * 64-bit accumulator.  The bit-position lives in rcx precisely so cl
++	 * is already the shift count: a single shlq %cl with no register move
++	 * and no push/pop-around-shlq (the inner counter lives in r10).  Then
++	 * advance the bit-position by the 4 PTEs consumed this iteration.
 +	 */
-+	pushq	%rcx
-+	movq	%r9, %rcx
-+	shlq	%cl, %rax		/* rax <<= bit-position (0..60)      */
-+	orq	%rax, %r8		/* accumulate into output ulong      */
-+	popq	%rcx
-+	addq	$4, %r9
++	shlq	%cl, %rax		/* rax <<= bit-position              */
++	orq	%rax, %r8		/* block A -> accumulator A           */
++	addq	$4, %rcx		/* advance bit-position by 4 PTEs    */
 +
-+	decl	%ecx
++	/*
++	 * Block B: a second 4-PTE block into a SEPARATE ulong (r9) so its
++	 * shift+OR carry chain is independent of block A's. Block B lands at
++	 * bit-positions 4,12,...,60 (A at 0,8,...,56); disjoint, so r8|r9
++	 * after the loop is the full 64-bit ulong.
++	 */
++	vmovmskpd %ymm2, %eax		/* block B mask (loaded up front)     */
++	shlq	%cl, %rax
++	orq	%rax, %r9		/* block B -> accumulator B           */
++	addq	$4, %rcx
++
++	decl	%r10d
 +	jnz	.Linner_avx2
 +
-+	/* Store the completed ulong into bitmap. */
++	/* Combine the two split accumulators, then store the ulong. */
++	orq	%r9, %r8
 +	movq	%r8, (%r11)
 +	addq	$8, %r11		/* advance bitmap write pointer     */
 +
@@ -5046,10 +5041,10 @@ index 0000000000..23c28d3996
 +SYM_FUNC_END(lru_marie_simd_scan_avx2)
 diff --git a/mm/lru_marie/simd_x86_avx512.S b/mm/lru_marie/simd_x86_avx512.S
 new file mode 100644
-index 0000000000..18d73dbd8b
+index 0000000000..66c81a1998
 --- /dev/null
 +++ b/mm/lru_marie/simd_x86_avx512.S
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,220 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * mm/lru_marie/simd_x86_avx512.S -- AVX-512F PTE young-bit scan for Marie walker.
@@ -5097,10 +5092,12 @@ index 0000000000..18d73dbd8b
 + *   rdi   = current PTE pointer (walks forward by 64 bytes per inner iter)
 + *   rsi   = bitmap base (constant)
 + *   rdx   = outer loop counter (8 -> 0)
-+ *   rcx   = inner loop counter (8 -> 0)
++ *   rcx   = bit-position counter within current ulong (0, 8, 16, ..., 56);
++ *           cl is directly the shlq shift count, so no register move and no
++ *           push/pop-around-shlq are needed
 + *   rax   = kmovw result / shift scratch
 + *   r8    = per-ulong accumulator
-+ *   r9    = bit-position counter within current ulong (0, 8, 16, ..., 56)
++ *   r10   = inner loop counter (8 -> 0)
 + *   r11   = bitmap write pointer (rsi + outer*8, updated each outer iter)
 + *
 + * Opmask register constraints:
@@ -5160,9 +5157,10 @@ index 0000000000..18d73dbd8b
 +	 * (8 PTEs per step) and writes one 64-bit ulong to the bitmap.
 +	 */
 +.Louter_avx512:
-+	xorq	%r8, %r8		/* accumulator = 0                  */
-+	xorq	%r9, %r9		/* bit-position = 0 (steps of 8)    */
-+	movl	$8, %ecx		/* inner counter: 8 SIMD iters      */
++	xorq	%r8, %r8		/* accumulator A = 0                */
++	xorq	%r9, %r9		/* accumulator B = 0 (split chain)  */
++	xorq	%rcx, %rcx		/* bit-position = 0 (cl = shift cnt)*/
++	movl	$4, %r10d		/* inner counter: 4 x 2 unrolled    */
 +
 +	/*
 +	 * Inner loop: one iteration processes 8 PTEs => 8 result bits.
@@ -5183,13 +5181,18 @@ index 0000000000..18d73dbd8b
 +	 *   6. OR into r8 accumulator; advance bit-position by 8.
 +	 *
 +	 * The variable-shift idiom (shlq %cl, rax) requires the shift count
-+	 * in cl.  We temporarily borrow rcx (inner loop counter) by pushing
-+	 * and popping around each shift.
++	 * in cl, so the bit-position is kept in rcx directly and the inner
++	 * loop counter lives in r10 -- no push/pop-around-shlq is needed.
 +	 */
 +.Linner_avx512:
-+	/* Load 8 PTEs into zmm1 (64 bytes, EVEX-encoded unaligned load). */
-+	vmovdqu64	(%rdi), %zmm1		/* zmm1 = pte[7]..pte[0]        */
-+	addq	$64, %rdi
++	/*
++	 * DUAL-LOAD: issue both 8-PTE loads (zmm1, zmm2) up front so the two
++	 * cache misses are in flight together (memory-level parallelism) --
++	 * then test both, then merge A->r8 / B->r9 (split accumulators).
++	 */
++	vmovdqu64	0(%rdi), %zmm1		/* block A: pte[7]..pte[0]      */
++	vmovdqu64	64(%rdi), %zmm2		/* block B: pte[15]..pte[8]    */
++	addq	$128, %rdi
 +
 +	/*
 +	 * VPTESTMQ: for each 64-bit lane i, compute:
@@ -5204,7 +5207,8 @@ index 0000000000..18d73dbd8b
 +	 * nonzero bit after AND with the narrow mask, but since the mask is
 +	 * exactly 0x20 (single bit), the result is correct for any PFN.
 +	 */
-+	vptestmq	%zmm1, %zmm0, %k1	/* k1[i] = pte[i] has young bit */
++	vptestmq	%zmm1, %zmm0, %k1	/* block A young mask -> k1     */
++	vptestmq	%zmm2, %zmm0, %k2	/* block B young mask -> k2     */
 +
 +	/*
 +	 * KMOVW: move the 16-bit opmask register k1 to eax.
@@ -5218,23 +5222,35 @@ index 0000000000..18d73dbd8b
 +
 +	/*
 +	 * Shift the 8-bit result to the correct position in the accumulator.
-+	 * r9 = 0 for the first inner iter, 8 for the second, ..., 56 for
++	 * rcx = 0 for the first inner iter, 8 for the second, ..., 56 for
 +	 * the eighth.  After shifting, rax holds the 8 result bits at their
 +	 * correct positions within the 64-bit ulong.
 +	 *
-+	 * Use CL-based variable shift; save/restore rcx (inner loop counter).
++	 * The bit-position lives in rcx so cl is already the shift count: a
++	 * single shlq %cl with no register move and no push/pop-around-shlq
++	 * (the inner counter lives in r10).
 +	 */
-+	pushq	%rcx
-+	movq	%r9, %rcx
-+	shlq	%cl, %rax			/* rax <<= bit-position (0..56)  */
-+	orq	%rax, %r8			/* accumulate into output ulong  */
-+	popq	%rcx
-+	addq	$8, %r9				/* advance bit-position by 8     */
++	shlq	%cl, %rax			/* rax <<= bit-position          */
++	orq	%rax, %r8			/* block A -> accumulator A       */
++	addq	$8, %rcx			/* advance bit-position by 8     */
 +
-+	decl	%ecx
++	/*
++	 * Block B: a second 8-PTE block, accumulated into a SEPARATE ulong
++	 * (r9) so its shift+OR carry chain is independent of block A's -- two
++	 * 4-deep chains in parallel instead of one 8-deep serial chain into
++	 * r8. Block B lands at bit-positions 8,24,40,56 (A at 0,16,32,48);
++	 * disjoint, so r8|r9 after the loop is the full 64-bit ulong.
++	 */
++	kmovw	%k2, %eax			/* block B mask (loaded up front) */
++	shlq	%cl, %rax
++	orq	%rax, %r9			/* block B -> accumulator B       */
++	addq	$8, %rcx
++
++	decl	%r10d
 +	jnz	.Linner_avx512
 +
-+	/* Store the completed ulong into bitmap. */
++	/* Combine the two split accumulators, then store the ulong. */
++	orq	%r9, %r8
 +	movq	%r8, (%r11)
 +	addq	$8, %r11		/* advance bitmap write pointer     */
 +
@@ -5251,7 +5267,7 @@ index 0000000000..18d73dbd8b
 +SYM_FUNC_END(lru_marie_simd_scan_avx512)
 diff --git a/mm/lru_marie/simd_x86_sse2.S b/mm/lru_marie/simd_x86_sse2.S
 new file mode 100644
-index 0000000000..71f8eff7e5
+index 0000000000..b86381ab5f
 --- /dev/null
 +++ b/mm/lru_marie/simd_x86_sse2.S
 @@ -0,0 +1,158 @@
@@ -5286,10 +5302,12 @@ index 0000000000..71f8eff7e5
 + *   rdi   = current PTE pointer (walks forward)
 + *   rsi   = bitmap base (constant)
 + *   rdx   = outer loop counter (8 -> 0)
-+ *   rcx   = inner loop counter (16 -> 0)
++ *   rcx   = bit-position counter within current ulong (steps of 4, 0..60);
++ *           cl is directly the shlq shift count, so no register move and no
++ *           push/pop-around-shlq are needed
 + *   rax   = movmskps result (4-bit young mask) / shift scratch
 + *   r8    = per-ulong accumulator
-+ *   r9    = bit-position counter within current ulong (steps of 4, 0..60)
++ *   r10   = inner loop counter (16 -> 0)
 + *   r11   = bitmap write pointer (rsi + outer*8, updated each outer iter)
 + *
 + * SSE2 only (x86-64 ABI baseline since AMD Opteron 2003):
@@ -5332,8 +5350,8 @@ index 0000000000..71f8eff7e5
 +	 */
 +.Louter:
 +	xorq	%r8, %r8		/* accumulator = 0                  */
-+	xorq	%r9, %r9		/* bit-position = 0                 */
-+	movl	$16, %ecx		/* inner counter: 16 SIMD iters     */
++	xorq	%rcx, %rcx		/* bit-position = 0 (cl = shift cnt)*/
++	movl	$16, %r10d		/* inner counter: 16 SIMD iters     */
 +
 +	/*
 +	 * Inner loop: one iteration processes 4 PTEs => 4 result bits.
@@ -5389,19 +5407,17 @@ index 0000000000..71f8eff7e5
 +	movmskps %xmm1, %eax		/* eax[3:0] = 4 young bits, one/PTE  */
 +
 +	/*
-+	 * Place the 4-bit group at bit-position r9 (0, 4, 8, ..., 60) in the
-+	 * 64-bit accumulator.  CL-shift idiom: borrow rcx (inner counter)
-+	 * around the single variable shift, then advance r9 by the 4 PTEs
-+	 * consumed this iteration.
++	 * Place the 4-bit group at bit-position rcx (0, 4, 8, ..., 60) in the
++	 * 64-bit accumulator.  The bit-position lives in rcx precisely so cl
++	 * is already the shift count: a single shlq %cl with no register move
++	 * and no push/pop-around-shlq (the inner counter lives in r10).  Then
++	 * advance the bit-position by the 4 PTEs consumed this iteration.
 +	 */
-+	pushq	%rcx
-+	movq	%r9, %rcx
 +	shlq	%cl, %rax		/* rax <<= bit-position (0..60)      */
 +	orq	%rax, %r8		/* accumulate into output ulong      */
-+	popq	%rcx
-+	addq	$4, %r9
++	addq	$4, %rcx		/* advance bit-position by 4 PTEs    */
 +
-+	decl	%ecx
++	decl	%r10d
 +	jnz	.Linner
 +
 +	/* Store the completed ulong into bitmap. */
@@ -9535,7 +9551,7 @@ index 0000000000..9382ade9a5
 +#endif /* _MM_LRU_MARIE_STATE_COMPAT_H */
 diff --git a/mm/lru_marie/version.h b/mm/lru_marie/version.h
 new file mode 100644
-index 0000000000..8edb82807a
+index 0000000000..3031710a02
 --- /dev/null
 +++ b/mm/lru_marie/version.h
 @@ -0,0 +1,22 @@
@@ -9558,7 +9574,7 @@ index 0000000000..8edb82807a
 +#define MARIE_PROGNAME	"Marie LRU"
 +#define MARIE_AUTHOR	"Masahito Suzuki"
 +
-+#define MARIE_VERSION	"0.7.7"
++#define MARIE_VERSION	"0.7.8"
 +
 +#endif /* _MM_LRU_MARIE_VERSION_H */
 diff --git a/mm/lru_marie/walker.c b/mm/lru_marie/walker.c
@@ -10699,7 +10715,7 @@ index f2944748f5..856c6e1f88 100644
  
  	for (i = 0; i < NR_VMSCAN_THROTTLE; i++)
 diff --git a/mm/oom_kill.c b/mm/oom_kill.c
-index 25923cfec9..94c594a921 100644
+index 25923cfec9..952c64bb32 100644
 --- a/mm/oom_kill.c
 +++ b/mm/oom_kill.c
 @@ -45,6 +45,10 @@
@@ -10749,7 +10765,7 @@ index 25923cfec9..94c594a921 100644
  };
  #endif
  
-@@ -1264,3 +1290,294 @@ SYSCALL_DEFINE2(process_mrelease, int, pidfd, unsigned int, flags)
+@@ -1264,3 +1290,312 @@ SYSCALL_DEFINE2(process_mrelease, int, pidfd, unsigned int, flags)
  	return -ENOSYS;
  #endif /* CONFIG_MMU */
  }
@@ -10920,13 +10936,31 @@ index 25923cfec9..94c594a921 100644
 +			last_steals = steals;
 +
 +			if (ds < totalram_pages() / 512 || dr * 2 < ds ||
-+			    free > high * 2 || free > last_free + (ds >> 2)) {
-+				/* No treadmill, or free recovered: net progress. */
++			    free > high || free > last_free + (ds >> 2)) {
++				/*
++				 * No treadmill, or reclaim is winning. free > high
++				 * means kswapd rebuilt headroom back above the high
++				 * watermark, so no allocation is anywhere near the OOM
++				 * path -- a busy (heavily paging) but healthy
++				 * over-committed box, not a livelock; firing here is
++				 * pure collateral damage. A genuine treadmill is
++				 * defined by free pinned in [min, high] (reclaim cannot
++				 * reach high); free climbing past high is progress.
++				 *
++				 * (Was free > high*2. The 2x band is narrow on small-
++				 * RAM systems -- e.g. 67MB..135MB on a 3G box -- so a
++				 * healthy workload sitting just above high with dr~=ds
++				 * steady-state paging fell inside it and false-fired.
++				 * Tightening to high leaves the free<=high detection
++				 * below byte-identical; it only drops the mild-tier
++				 * firing in (high, 2*high], which is the false region.)
++				 */
 +				hot_windows = 0;
 +			} else {
-+				w = 1;
++				/* free <= high is guaranteed by the escape above
++				 * (base 2 folds in the old "below high wmark" +1). */
++				w = 2;
 +				if (dr >= ds)		w += 3;	/* ~zero net progress */
-+				if (free <= high)	w += 1;	/* below high wmark */
 +				if (free <= min * 2)	w += 3;	/* into the reserves */
 +				hot_windows += w;
 +				if (hot_windows >= THRASH_WD_SCORE) {
