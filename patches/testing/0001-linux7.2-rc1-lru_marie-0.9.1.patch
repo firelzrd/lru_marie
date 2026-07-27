@@ -1,7 +1,7 @@
-From 9ba9a55df4929c93cc4112359918eb64f0413243 Mon Sep 17 00:00:00 2001
+From e167b46734efd539db3b20dfac5076275a8c5f19 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Thu, 23 Jul 2026 08:11:50 +0900
-Subject: [PATCH] linux7.2-rc1-lru_marie-0.9.0
+Date: Tue, 28 Jul 2026 04:32:09 +0900
+Subject: [PATCH] linux7.2-rc1-lru_marie-0.9.1
 
 ---
  include/linux/lru_marie.h      |  498 +++++
@@ -19,7 +19,7 @@ Subject: [PATCH] linux7.2-rc1-lru_marie-0.9.0
  mm/lru_marie/bitmap.c          |  118 ++
  mm/lru_marie/bitmap.h          |  221 +++
  mm/lru_marie/core.c            | 1201 +++++++++++++
- mm/lru_marie/defrag.c          | 1088 +++++++++++
+ mm/lru_marie/defrag.c          | 1199 +++++++++++++
  mm/lru_marie/defrag.h          |   85 +
  mm/lru_marie/defrag_compat.h   |   53 +
  mm/lru_marie/pfn_install.h     |  139 ++
@@ -46,7 +46,7 @@ Subject: [PATCH] linux7.2-rc1-lru_marie-0.9.0
  mm/swap.c                      |  258 ++-
  mm/swap.h                      |    4 +
  mm/vmscan.c                    |  341 +++-
- 42 files changed, 11506 insertions(+), 28 deletions(-)
+ 42 files changed, 11617 insertions(+), 28 deletions(-)
  create mode 100644 include/linux/lru_marie.h
  create mode 100644 mm/lru_marie/Makefile
  create mode 100644 mm/lru_marie/account.h
@@ -2873,10 +2873,10 @@ index 0000000000..1a16cdd12d
 +subsys_initcall(marie_init);
 diff --git a/mm/lru_marie/defrag.c b/mm/lru_marie/defrag.c
 new file mode 100644
-index 0000000000..2583b1fd02
+index 0000000000..dc623aecba
 --- /dev/null
 +++ b/mm/lru_marie/defrag.c
-@@ -0,0 +1,1088 @@
+@@ -0,0 +1,1199 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * mm/lru_marie/defrag.c -- Marie defragmentation, Step 1.
@@ -3052,23 +3052,23 @@ index 0000000000..2583b1fd02
 +#define MARIE_DEFRAG_C_MOVE_FILE	 3u	/* warm clean unmapped file: copy + xarray, no TLB */
 +#define MARIE_DEFRAG_C_MOVE_ANON	16u	/* anon: always mapped -> copy + rmap + TLB shootdown */
 +
-+/* The oldest MARIE_DEFRAG_DROP_BAND gens (by ring distance from head) are drop-eligible. */
-+#define MARIE_DEFRAG_DROP_BAND	 2
-+
 +/*
-+ * Per-occupant cost. age = ring distance from the (youngest) per-type head
-+ * gen, so coldness is head-relative (defrag_design.md §17.3): older file
-+ * is drop-eligible (near free); anon is TLB-bound regardless of age because it
-+ * is always mapped. Volatile mapped/dirty refinement is left to phase 2 / the
-+ * later learned coeffs; phase 1 scores on the stable (gen, type) class.
++ * Per-occupant cost. Drop-eligibility is K=1: only the single gen
++ * marie_find_oldest_occupied_mlv(FILE) reports as the oldest still-occupied
++ * file gen is drop-eligible (near free); anon is TLB-bound regardless of age
++ * because it is always mapped. @oldest_file is that gen (or -1 if no file gen
++ * is occupied at all, e.g. immediately post-boot -- nothing is droppable
++ * then). marie_find_oldest_occupied_mlv scans forward from head+1, so it can
++ * never return head itself: the head's own (youngest) gen is structurally
++ * excluded, not just numerically unlikely. Volatile mapped/dirty refinement
++ * is left to phase 2 / the later learned coeffs; phase 1 scores on the stable
++ * (gen, type) class.
 + */
-+static inline u32 marie_defrag_coeff(int gen, int type, u8 head)
++static inline u32 marie_defrag_coeff(int gen, int type, int oldest_file)
 +{
-+	int age = (head - gen) & (MARIE_DEFRAG_NGENS - 1);
-+
 +	if (type)	/* FILE */
-+		return (age >= MARIE_DEFRAG_NGENS - MARIE_DEFRAG_DROP_BAND) ? MARIE_DEFRAG_C_DROP
-+							  : MARIE_DEFRAG_C_MOVE_FILE;
++		return (oldest_file >= 0 && gen == oldest_file) ? MARIE_DEFRAG_C_DROP
++								 : MARIE_DEFRAG_C_MOVE_FILE;
 +	return MARIE_DEFRAG_C_MOVE_ANON;	/* ANON */
 +}
 +
@@ -3082,8 +3082,7 @@ index 0000000000..2583b1fd02
 +	return occ;
 +}
 +
-+static u64 marie_defrag_block_cost(const struct marie_defrag_block_hist *h, u8 head_anon,
-+			  u8 head_file)
++static u64 marie_defrag_block_cost(const struct marie_defrag_block_hist *h, int oldest_file)
 +{
 +	u64 cost = 0;
 +	int g;
@@ -3092,8 +3091,8 @@ index 0000000000..2583b1fd02
 +		long ca = atomic_read(&h->count[g * MARIE_DEFRAG_NTYPES + 0]);
 +		long cf = atomic_read(&h->count[g * MARIE_DEFRAG_NTYPES + 1]);
 +
-+		cost += (u64)ca * marie_defrag_coeff(g, 0, head_anon);
-+		cost += (u64)cf * marie_defrag_coeff(g, 1, head_file);
++		cost += (u64)ca * marie_defrag_coeff(g, 0, oldest_file);
++		cost += (u64)cf * marie_defrag_coeff(g, 1, oldest_file);
 +	}
 +	return cost;
 +}
@@ -3128,8 +3127,7 @@ index 0000000000..2583b1fd02
 +static int marie_defrag_collect(struct marie_defrag_cand *top, unsigned long *scanned_out,
 +		       unsigned long *movable_out)
 +{
-+	u8 head_anon = (u8)atomic_read(&marie_head_gen[0]);
-+	u8 head_file = (u8)atomic_read(&marie_head_gen[1]);
++	int oldest_file = marie_find_oldest_occupied_mlv(1);
 +	unsigned long b, scanned = 0, movable = 0;
 +	int n = 0;
 +
@@ -3146,7 +3144,7 @@ index 0000000000..2583b1fd02
 +		if (get_pageblock_migratetype(pfn_to_page(pfn)) != MIGRATE_MOVABLE)
 +			continue;
 +		movable++;
-+		marie_defrag_topk_insert(top, &n, marie_defrag_block_cost(h, head_anon, head_file),
++		marie_defrag_topk_insert(top, &n, marie_defrag_block_cost(h, oldest_file),
 +				b, occ);
 +	}
 +	if (scanned_out)
@@ -3205,6 +3203,17 @@ index 0000000000..2583b1fd02
 + */
 +static unsigned int marie_defrag_enabled = 1;
 +static atomic_long_t marie_defrag_fires;	/* proactive replacements done (stat) */
++
++/*
++ * Safety killswitch (sysfs /sys/kernel/mm/lru_marie/defrag_drop): 1 (DEFAULT)
++ * = urgent/direct compaction may DROP cold-dead clean file as designed; 0 =
++ * never DROP, even when the caller's may_drop says the path is urgent --
++ * compaction falls back to MOVE-only, identical to the proactive path. Lets
++ * an operator disable the drop-and-refault-risk rung alone if it proves
++ * harmful on a given workload, without losing Marie defrag's MOVE-based
++ * compaction (that would require the coarser .../defrag master switch).
++ */
++static unsigned int marie_defrag_drop_enabled = 1;
 +
 +/* Cap harvested hole order so we never break a near-pageblock free block. */
 +#define MARIE_DEFRAG_HARVEST_MAX_ORDER	3
@@ -3541,17 +3550,26 @@ index 0000000000..2583b1fd02
 + * A cold-dead, clean, unmapped FILE folio is DROPPED (reclaimed) rather than
 + * moved: near-free -- no target page, no copy, no TLB (design §5 rung 1). @s is
 + * the per-PFN byte read just before isolation (so it still carries the gen).
-+ * Conservative gate: only the oldest MARIE_DEFRAG_DROP_BAND gens (head-relative), and
-+ * only clean + unmapped + file -- exactly the folios Marie's own swappiness=1
-+ * reclaim would drop first, so the refault risk is the normal cold-cache one.
-+ * anon is never dropped (that would need swap, defeating "near-free"); the
-+ * per-gen learned p_refault crossover (design §8.2) is a later refinement of
-+ * this static band.
++ * Conservative gate: only the single oldest still-occupied file gen
++ * (@oldest_file, K=1 -- marie_find_oldest_occupied_mlv(FILE), NOT a static
++ * head-relative age band: that formula assumed a fully-populated ring and
++ * under-fired -- never dropping anything -- whenever file occupancy was
++ * sparse), and only clean + unmapped + file -- exactly the folios Marie's own
++ * swappiness=1 reclaim would drop first, so the refault risk is the normal
++ * cold-cache one. @oldest_file < 0 means no file gen is occupied at all,
++ * so nothing is droppable. marie_find_oldest_occupied_mlv scans forward from
++ * head+1 and so can never return head itself -- the head's own (youngest)
++ * gen is structurally excluded from this test, never just a numeric
++ * near-miss. anon is never dropped (that would need swap, defeating
++ * "near-free"); the per-gen learned p_refault crossover (design §8.2) is a
++ * later refinement of this K=1 rule.
 + */
-+static bool marie_defrag_droppable(struct folio *folio, u8 s, u8 head_file)
++static bool marie_defrag_droppable(struct folio *folio, u8 s, int oldest_file)
 +{
-+	int gen, age;
++	int gen;
 +
++	if (oldest_file < 0)
++		return false;
 +	if (!(s & MARIE_PFN_TYPE_FILE))
 +		return false;
 +	if (folio_test_dirty(folio) || folio_test_writeback(folio))
@@ -3559,8 +3577,7 @@ index 0000000000..2583b1fd02
 +	if (folio_mapped(folio) || folio_test_unevictable(folio))
 +		return false;
 +	gen = (s & MARIE_PFN_GEN_MASK) >> MARIE_PFN_GEN_SHIFT;
-+	age = (head_file - gen) & (MARIE_PFN_NR_GENS - 1);
-+	return age >= MARIE_PFN_NR_GENS - MARIE_DEFRAG_DROP_BAND;
++	return gen == oldest_file;
 +}
 +
 +/*
@@ -3598,7 +3615,7 @@ index 0000000000..2583b1fd02
 + */
 +static void marie_defrag_isolate_block(struct marie_defrag_freectx *fc, unsigned long blk,
 +			      struct list_head *move_list,
-+			      struct list_head *drop_list, u8 head_file,
++			      struct list_head *drop_list, int oldest_file,
 +			      bool may_drop, long *drop_budget,
 +			      int *n_move, int *n_drop)
 +{
@@ -3633,7 +3650,7 @@ index 0000000000..2583b1fd02
 +		 * protected clean-file reserve is never breached.
 +		 */
 +		drop = may_drop && *drop_budget >= nr &&
-+		       marie_defrag_droppable(folio, s, head_file);
++		       marie_defrag_droppable(folio, s, oldest_file);
 +		if (folio_isolate_lru(folio)) {
 +			if (drop) {
 +				list_add(&folio->lru, drop_list);
@@ -3667,14 +3684,21 @@ index 0000000000..2583b1fd02
 + * Compact the @n cheapest movable source blocks (capped at MARIE_DEFRAG_TOPK): isolate
 + * all their folios, harvest an equal number of target holes from OTHER partial
 + * movable blocks, then migrate into the harvested pool.
++ *
++ * @drop_need is the caller's marie_defrag_drop_need() result: 0 means DROP is
++ * off for this run (MOVE only), otherwise the number of pages this specific
++ * blocked allocation needs. The actual drop_budget is capped at that need --
++ * see marie_defrag_drop_need() -- and separately at the clean_min_ratio floor
++ * (marie_defrag_drop_budget()), whichever is smaller.
 + */
-+static void marie_defrag_topn(unsigned int n, bool may_drop)
++static void marie_defrag_topn(unsigned int n, unsigned long drop_need)
 +{
 +	struct marie_defrag_cand top[MARIE_DEFRAG_TOPK];
 +	struct marie_defrag_freectx fc;
 +	LIST_HEAD(move_list);
 +	LIST_HEAD(drop_list);
-+	u8 head_file;
++	int oldest_file;
++	bool may_drop = drop_need > 0;
 +	long drop_budget;
 +	unsigned int blocks = 0, migrated = 0, dropped = 0, freed = 0, restamped = 0;
 +	int collected, i, n_move = 0, n_drop = 0, nr_succeeded = 0;
@@ -3700,12 +3724,13 @@ index 0000000000..2583b1fd02
 +	 * and MOVE. This already decremented the source histograms, so the source
 +	 * blocks read occupancy 0 below.
 +	 */
-+	head_file = (u8)atomic_read(&marie_head_gen[1]);
++	oldest_file = marie_find_oldest_occupied_mlv(1);
 +	drop_budget = may_drop ?
-+		marie_defrag_drop_budget(NODE_DATA(first_online_node)) : 0;
++		min_t(long, (long)drop_need,
++		      marie_defrag_drop_budget(NODE_DATA(first_online_node))) : 0;
 +	for (i = 0; i < (int)n; i++) {
 +		marie_defrag_isolate_block(&fc, top[i].blk, &move_list, &drop_list,
-+				  head_file, may_drop, &drop_budget, &n_move, &n_drop);
++				  oldest_file, may_drop, &drop_budget, &n_move, &n_drop);
 +		blocks++;
 +		cond_resched();
 +	}
@@ -3885,6 +3910,19 @@ index 0000000000..2583b1fd02
 + * background must not. Runs in the kcompactd kthread context (sleeping allowed,
 + * off the allocation hot path). The .../defrag_run node still triggers a manual
 + * one-shot (+N urgent / -N background) regardless of the switch, for testing.
++ *
++ * /sys/kernel/mm/lru_marie/defrag_drop is a separate, finer-grained killswitch:
++ * 0 forces every DROP decision to fall back to MOVE regardless of may_drop,
++ * without touching the master defrag switch above (see marie_defrag_drop_enabled).
++ *
++ * DROP additionally requires marie_defrag_drop_need(pgdat) > 0: may_drop=true
++ * alone only means the demand path is order-blocked (fragmented), not that
++ * free memory is actually short, so it is gated on a WMARK_LOW check at the
++ * blocked allocation's own order before anything is dropped. When it does
++ * fire, the DROP budget is capped at that allocation's own size (1 << order),
++ * not "drop everything droppable up to the clean_min_ratio floor" -- see
++ * marie_defrag_drop_need() for why headroom already free elsewhere isn't
++ * credited against the budget.
 + */
 +#define MARIE_DEFRAG_BATCH	16		/* source blocks per kcompactd wake */
 +
@@ -3902,11 +3940,58 @@ index 0000000000..2583b1fd02
 +EXPORT_SYMBOL_GPL(lru_marie_defrag_active);
 +
 +/*
++ * Is @pgdat under real reclaim pressure right now, as opposed to merely
++ * fragmented, for the actual allocation kcompactd is trying to unblock? A
++ * demand-path may_drop=true fires purely on allocation ORDER (a high-order
++ * block is unavailable) and says nothing about how much free memory actually
++ * exists. Checking at order 0 would answer the wrong question too -- order 0
++ * passes almost everywhere and says nothing about whether THIS high-order
++ * request can be met -- so the check runs at kcompactd's own
++ * pgdat->kcompactd_max_order (read here before kcompactd_do_work resets it),
++ * the same loop shape as kcompactd_node_suitable() a few lines up in
++ * mm/compaction.c. This is deliberately NOT shared with
++ * thrash_wd_mem_pressured() (mm/oom_kill.c): that watchdog answers a
++ * different, order/zone-agnostic question (is the whole system livelocked)
++ * with an empirically-tuned raw global free-vs-high-watermark ratio: mixing
++ * in zone_watermark_ok()'s per-zone lowmem_reserve/CMA/highatomic exclusions
++ * would silently shift that already-incident-tuned threshold.
++ *
++ * Returns the DROP budget in pages: 0 when every zone clears the check
++ * (nothing to drop), else the size of the block this allocation actually
++ * needs (1 << order). Deliberately NOT "block size minus existing
++ * watermark headroom": a DROPped folio is freed wherever it happened to be
++ * cold in whichever candidate block Marie picked, with no guaranteed
++ * spatial relation to wherever that headroom already sits, so crediting it
++ * against the budget would assume a contiguity DROP cannot promise. The
++ * order's own size is the defensible, self-contained amount -- enough to
++ * plausibly cover this one allocation, no more.
++ */
++static unsigned long marie_defrag_drop_need(struct pglist_data *pgdat)
++{
++	enum zone_type highest_zoneidx = pgdat->kcompactd_highest_zoneidx;
++	unsigned int order = pgdat->kcompactd_max_order;
++	int zoneid;
++
++	for (zoneid = 0; zoneid <= highest_zoneidx; zoneid++) {
++		struct zone *zone = &pgdat->node_zones[zoneid];
++
++		if (!populated_zone(zone))
++			continue;
++		if (!zone_watermark_ok(zone, order, low_wmark_pages(zone),
++					highest_zoneidx, 0))
++			return 1UL << order;
++	}
++	return 0;
++}
++
++/*
 + * Run one Marie defrag pass for @pgdat. @may_drop is set by the caller from the
 + * kcompactd path's urgency: demand=true (MOVE + DROP), proactive=false (MOVE only).
 + */
 +void lru_marie_defrag_pgdat(struct pglist_data *pgdat, bool may_drop)
 +{
++	unsigned long drop_need;
++
 +	if (!marie_defrag_hist)
 +		return;
 +	/*
@@ -3923,7 +4008,9 @@ index 0000000000..2583b1fd02
 +	 * nodes; per-node Marie defrag is a refinement matching Marie's global posture.
 +	 */
 +	atomic_long_inc(&marie_defrag_fires);
-+	marie_defrag_topn(MARIE_DEFRAG_BATCH, may_drop);
++	drop_need = (may_drop && READ_ONCE(marie_defrag_drop_enabled)) ?
++		marie_defrag_drop_need(pgdat) : 0;
++	marie_defrag_topn(MARIE_DEFRAG_BATCH, drop_need);
 +	atomic_set(&marie_defrag_busy, 0);
 +}
 +
@@ -3948,6 +4035,27 @@ index 0000000000..2583b1fd02
 +static struct kobj_attribute marie_defrag_switch_attr =
 +	__ATTR(defrag, 0644, marie_defrag_enabled_show, marie_defrag_enabled_store);
 +
++static ssize_t marie_defrag_drop_enabled_show(struct kobject *kobj, struct kobj_attribute *attr,
++				  char *buf)
++{
++	return sysfs_emit(buf, "%u\n", READ_ONCE(marie_defrag_drop_enabled));
++}
++
++static ssize_t marie_defrag_drop_enabled_store(struct kobject *kobj, struct kobj_attribute *attr,
++				   const char *buf, size_t count)
++{
++	unsigned int v;
++	int err = kstrtouint(buf, 10, &v);
++
++	if (err)
++		return err;
++	WRITE_ONCE(marie_defrag_drop_enabled, !!v);
++	return count;
++}
++
++static struct kobj_attribute marie_defrag_drop_attr =
++	__ATTR(defrag_drop, 0644, marie_defrag_drop_enabled_show, marie_defrag_drop_enabled_store);
++
 +int __init marie_defrag_init(struct kobject *parent)
 +{
 +	int err = marie_defrag_hist_alloc();
@@ -3963,6 +4071,9 @@ index 0000000000..2583b1fd02
 +	err = sysfs_create_file(parent, &marie_defrag_stats_attr.attr);
 +	if (err)
 +		pr_warn("failed to create sysfs defrag_stats node: %d\n", err);
++	err = sysfs_create_file(parent, &marie_defrag_drop_attr.attr);
++	if (err)
++		pr_warn("failed to create sysfs defrag_drop node: %d\n", err);
 +	return 0;
 +}
 diff --git a/mm/lru_marie/defrag.h b/mm/lru_marie/defrag.h
@@ -9507,7 +9618,7 @@ index 0000000000..4d07cedd9c
 +#endif /* _MM_LRU_MARIE_STATE_COMPAT_H */
 diff --git a/mm/lru_marie/version.h b/mm/lru_marie/version.h
 new file mode 100644
-index 0000000000..0cb1b75668
+index 0000000000..97dbf2fa51
 --- /dev/null
 +++ b/mm/lru_marie/version.h
 @@ -0,0 +1,22 @@
@@ -9530,7 +9641,7 @@ index 0000000000..0cb1b75668
 +#define MARIE_PROGNAME	"Marie LRU"
 +#define MARIE_AUTHOR	"Masahito Suzuki"
 +
-+#define MARIE_VERSION	"0.9.0"
++#define MARIE_VERSION	"0.9.1"
 +
 +#endif /* _MM_LRU_MARIE_VERSION_H */
 diff --git a/mm/lru_marie/walker.c b/mm/lru_marie/walker.c
