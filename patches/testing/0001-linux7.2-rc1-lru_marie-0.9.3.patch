@@ -1,6 +1,6 @@
-From 050b2220066e7f546423a08fbb5fd1d46614d10a Mon Sep 17 00:00:00 2001
-From: Masahito S <firelzrd@gmail.com>
-Date: Fri, 7 Aug 2026 04:49:59 +0900
+From 0e08603653374a891b1fc0353e27de896a84a664 Mon Sep 17 00:00:00 2001
+From: Filip <denuvo@tuta.io>
+Date: Thu, 7 Aug 2026 14:51:44 +0200
 Subject: [PATCH] linux7.2-rc1-lru_marie-0.9.3
 
 ---
@@ -45,8 +45,8 @@ Subject: [PATCH] linux7.2-rc1-lru_marie-0.9.3
  mm/rmap.c                      |    6 +
  mm/swap.c                      |  258 ++-
  mm/swap.h                      |    4 +
- mm/vmscan.c                    |  341 +++-
- 42 files changed, 11703 insertions(+), 28 deletions(-)
+ mm/vmscan.c                    |  340 +++-
+ 42 files changed, 11702 insertions(+), 28 deletions(-)
  create mode 100644 include/linux/lru_marie.h
  create mode 100644 mm/lru_marie/Makefile
  create mode 100644 mm/lru_marie/account.h
@@ -12314,7 +12314,7 @@ index 35c3bb15ae..5c149b940d 100644
  	 */
  	if (referenced_ptes == -1)
  		return FOLIOREF_KEEP;
-@@ -891,6 +960,30 @@ static enum folio_references folio_check_references(struct folio *folio,
+@@ -891,6 +960,29 @@ static enum folio_references folio_check_references(struct folio *folio,
  
  	referenced_folio = folio_test_clear_referenced(folio);
  
@@ -12328,8 +12328,7 @@ index 35c3bb15ae..5c149b940d 100644
 +		if (hot_votes >= 2 || referenced_ptes > 1)
 +			return FOLIOREF_ACTIVATE;
 +
-+		if (referenced_ptes > 0 && (vm_flags & VM_EXEC) &&
-+		    						folio_is_file_lru(folio))
++		if (referenced_ptes > 0 && is_exec_file_folio(folio, &vma_flags))
 +			return FOLIOREF_ACTIVATE;
 +
 +		if (hot_votes == 1 && referenced_folio && folio_is_file_lru(folio))
