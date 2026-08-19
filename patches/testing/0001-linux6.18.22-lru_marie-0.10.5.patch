@@ -1,10 +1,10 @@
-From 2210165cd5bd77f161145e3935f9c485aa46567e Mon Sep 17 00:00:00 2001
+From 1d039defb8322724a6dcbaed4d08022ec009a375 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 16 Aug 2026 08:24:25 +0900
-Subject: [PATCH] linux6.18.22-lru_marie-0.10.1
+Date: Wed, 19 Aug 2026 12:03:07 +0900
+Subject: [PATCH] linux6.18.22-lru_marie-0.10.5
 
 ---
- include/linux/lru_marie.h      |  488 +++++++++
+ include/linux/lru_marie.h      |  488 ++++++++
  include/linux/memcontrol.h     |   26 +-
  include/linux/mm_inline.h      |  103 +-
  include/linux/mmzone.h         |   16 +
@@ -18,37 +18,37 @@ Subject: [PATCH] linux6.18.22-lru_marie-0.10.1
  mm/lru_marie/account.h         |  211 ++++
  mm/lru_marie/bitmap.c          |  186 ++++
  mm/lru_marie/bitmap.h          |  290 +++++
- mm/lru_marie/core.c            | 1292 ++++++++++++++++++++++
- mm/lru_marie/defrag.c          | 1210 +++++++++++++++++++++
+ mm/lru_marie/core.c            | 1300 ++++++++++++++++++++++
+ mm/lru_marie/defrag.c          | 1244 +++++++++++++++++++++
  mm/lru_marie/defrag.h          |   85 ++
  mm/lru_marie/defrag_compat.h   |   53 +
  mm/lru_marie/pfn_install.h     |  204 ++++
  mm/lru_marie/prefetch.h        |  111 ++
  mm/lru_marie/simd.h            |   73 ++
  mm/lru_marie/simd_generic.c    |   34 +
- mm/lru_marie/simd_x86.c        |  243 +++++
+ mm/lru_marie/simd_x86.c        |  243 ++++
  mm/lru_marie/simd_x86_avx2.S   |  170 +++
  mm/lru_marie/simd_x86_avx512.S |  220 ++++
  mm/lru_marie/simd_x86_sse2.S   |  158 +++
- mm/lru_marie/state.h           | 1213 +++++++++++++++++++++
+ mm/lru_marie/state.h           | 1255 +++++++++++++++++++++
  mm/lru_marie/state_compat.h    |   94 ++
- mm/lru_marie/state_core.c      |  824 ++++++++++++++
+ mm/lru_marie/state_core.c      |  830 ++++++++++++++
  mm/lru_marie/state_folio.c     |  587 ++++++++++
- mm/lru_marie/state_reclaim.c   | 1852 ++++++++++++++++++++++++++++++++
+ mm/lru_marie/state_reclaim.c   | 1908 ++++++++++++++++++++++++++++++++
  mm/lru_marie/version.h         |   22 +
  mm/lru_marie/walker.c          | 1073 ++++++++++++++++++
  mm/lru_marie/walker_compat.h   |   97 ++
  mm/memcontrol-v1.c             |   11 +
  mm/memcontrol.c                |   13 +
  mm/mm_init.c                   |    3 +
- mm/oom_kill.c                  |  365 +++++++
- mm/page_alloc.c                |  120 ++-
+ mm/oom_kill.c                  |  365 ++++++
+ mm/page_alloc.c                |  120 +-
  mm/page_io.c                   |  331 ++++++
  mm/rmap.c                      |    6 +
  mm/swap.c                      |  262 ++++-
  mm/swap.h                      |    4 +
  mm/vmscan.c                    |  416 ++++++-
- 44 files changed, 12689 insertions(+), 29 deletions(-)
+ 44 files changed, 12835 insertions(+), 29 deletions(-)
  create mode 100644 include/linux/lru_marie.h
  create mode 100644 mm/lru_marie/Makefile
  create mode 100644 mm/lru_marie/account.h
@@ -1902,10 +1902,10 @@ index 0000000000..fc6b8a24a4
 +#endif	/* _MM_LRU_MARIE_BITMAP_H */
 diff --git a/mm/lru_marie/core.c b/mm/lru_marie/core.c
 new file mode 100644
-index 0000000000..c83454d6dc
+index 0000000000..baa6ad2f9f
 --- /dev/null
 +++ b/mm/lru_marie/core.c
-@@ -0,0 +1,1292 @@
+@@ -0,0 +1,1300 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * mm/lru_marie/core.c — Marie LRU.
@@ -2733,8 +2733,9 @@ index 0000000000..c83454d6dc
 +	for (type = 0; type < 2; type++) {
 +		int head = atomic_read(&marie_head_gen[type]);
 +
-+		len += sysfs_emit_at(buf, len, "gen_ring %s head %d occ",
-+				     type ? "file" : "anon", head);
++		len += sysfs_emit_at(buf, len, "gen_ring %s head %d gens %d occ",
++				     type ? "file" : "anon", head,
++				     atomic_read(&marie_nr_occupied_gens[type]));
 +		for (i = 1; i <= MARIE_PFN_NR_GENS; i++) {
 +			int slot = (head + i) & (MARIE_PFN_NR_GENS - 1);
 +
@@ -2752,6 +2753,8 @@ index 0000000000..c83454d6dc
 +			  "orphan_bit anon %ld file %ld\n"
 +			  "gen_growth_live anon %lu file %lu\n"
 +			  "concede_pressure_mode %u\n"
++			  "ignore_refs anon forced %ld respected %ld\n"
++			  "ignore_refs file forced %ld respected %ld\n"
 +			  "concede floor %ld free %ld refault %ld memcg %ld\n",
 +			  percpu_counter_sum(&marie_nr_folios),
 +			  atomic_long_read(&marie_dbg_pick[0]),
@@ -2766,6 +2769,10 @@ index 0000000000..c83454d6dc
 +			  READ_ONCE(marie_gen_growth_live[0]),
 +			  READ_ONCE(marie_gen_growth_live[1]),
 +			  READ_ONCE(marie_concede_pressure_mode),
++			  atomic_long_read(&marie_dbg_ignore_refs[0][0]),
++			  atomic_long_read(&marie_dbg_ignore_refs[1][0]),
++			  atomic_long_read(&marie_dbg_ignore_refs[0][1]),
++			  atomic_long_read(&marie_dbg_ignore_refs[1][1]),
 +			  atomic_long_read(&marie_dbg_concede[0]),
 +			  atomic_long_read(&marie_dbg_concede[1]),
 +			  atomic_long_read(&marie_dbg_concede[2]),
@@ -2847,6 +2854,7 @@ index 0000000000..c83454d6dc
 +
 +static struct kobj_attribute marie_low_swappiness_mode_attr =
 +	__ATTR_RW(low_swappiness_mode);
++
 +
 +/*
 + * concede_pressure_mode — which pressure signal engages the FILE_THEN_ANON
@@ -3200,10 +3208,10 @@ index 0000000000..c83454d6dc
 +subsys_initcall(marie_init);
 diff --git a/mm/lru_marie/defrag.c b/mm/lru_marie/defrag.c
 new file mode 100644
-index 0000000000..c7becaaf3a
+index 0000000000..a1dbc8a13a
 --- /dev/null
 +++ b/mm/lru_marie/defrag.c
-@@ -0,0 +1,1210 @@
+@@ -0,0 +1,1244 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * mm/lru_marie/defrag.c -- Marie defragmentation, Step 1.
@@ -4255,8 +4263,8 @@ index 0000000000..c7becaaf3a
 + *
 + * DROP additionally requires marie_defrag_drop_need(pgdat) > 0: may_drop=true
 + * alone only means the demand path is order-blocked (fragmented), not that
-+ * free memory is actually short, so it is gated on a WMARK_LOW check at the
-+ * blocked allocation's own order before anything is dropped. When it does
++ * free memory is actually short, so it is gated on an order-0 WMARK_LOW check
++ * over the zones that can actually serve the request. When it does
 + * fire, the DROP budget is capped at that allocation's own size (1 << order),
 + * not "drop everything droppable up to the clean_min_ratio floor" -- see
 + * marie_defrag_drop_need() for why headroom already free elsewhere isn't
@@ -4282,12 +4290,15 @@ index 0000000000..c7becaaf3a
 + * fragmented, for the actual allocation kcompactd is trying to unblock? A
 + * demand-path may_drop=true fires purely on allocation ORDER (a high-order
 + * block is unavailable) and says nothing about how much free memory actually
-+ * exists. Checking at order 0 would answer the wrong question too -- order 0
-+ * passes almost everywhere and says nothing about whether THIS high-order
-+ * request can be met -- so the check runs at kcompactd's own
-+ * pgdat->kcompactd_max_order (read here before kcompactd_do_work resets it),
-+ * the same loop shape as kcompactd_node_suitable() a few lines up in
-+ * mm/compaction.c. This is deliberately NOT shared with
++ * exists, so that is what this asks -- at order 0, over the zones that can
++ * actually serve the request. Asking at kcompactd's own
++ * pgdat->kcompactd_max_order instead, as this originally did, only restates
++ * the premise: __zone_watermark_ok() returns false for "no free block of that
++ * order" as readily as for "not enough free pages", and the former is a given
++ * on the demand path. Combined with a loop that returned on the first failing
++ * zone -- and an x86_64 ZONE_DMA that fails any check made for a higher
++ * highest_zoneidx -- the gate never once closed. This is deliberately NOT
++ * shared with
 + * thrash_wd_mem_pressured() (mm/oom_kill.c): that watchdog answers a
 + * different, order/zone-agnostic question (is the whole system livelocked)
 + * with an empirically-tuned raw global free-vs-high-watermark ratio: mixing
@@ -4315,7 +4326,38 @@ index 0000000000..c7becaaf3a
 +
 +		if (!populated_zone(zone))
 +			continue;
-+		if (!zone_watermark_ok(zone, order, low_wmark_pages(zone),
++
++		/*
++		 * Skip zones that can never clear the watermark for
++		 * @highest_zoneidx no matter how much memory is free. A zone
++		 * whose entire managed size is smaller than
++		 * (watermark + lowmem_reserve) fails zone_watermark_ok()
++		 * unconditionally, so its failure carries no information about
++		 * pressure. On x86_64 ZONE_DMA is exactly this: 16 MiB of
++		 * managed pages against a multi-GiB ZONE_NORMAL reserve
++		 * (measured: 2816 free vs lowmem_reserve 31071). Reading that
++		 * as "free memory is short" made this whole gate fire on every
++		 * call -- the loop returns on the FIRST failing zone and
++		 * zoneid 0 always failed -- so DROP was permanently enabled
++		 * rather than pressure-gated.
++		 */
++		if (zone_managed_pages(zone) <=
++		    low_wmark_pages(zone) + zone->lowmem_reserve[highest_zoneidx])
++			continue;
++
++		/*
++		 * Ask at order 0, not at @order. Whether THIS high-order
++		 * request can be met is already answered -- it cannot, which
++		 * is why kcompactd was woken and why we are on the demand
++		 * path at all -- so re-asking it here only restates the
++		 * premise. The question that is still open, and the one this
++		 * gate exists to answer, is whether free memory is actually
++		 * short, and that is order-agnostic. zone_watermark_ok() at
++		 * @order conflated the two: it returns false for "no free
++		 * block of that order" as readily as for "not enough free
++		 * pages", i.e. it fails on fragmentation alone.
++		 */
++		if (!zone_watermark_ok(zone, 0, low_wmark_pages(zone),
 +					highest_zoneidx, 0))
 +			return 1UL << order;
 +	}
@@ -5827,10 +5869,10 @@ index 0000000000..b86381ab5f
 +SYM_FUNC_END(lru_marie_simd_scan_sse2)
 diff --git a/mm/lru_marie/state.h b/mm/lru_marie/state.h
 new file mode 100644
-index 0000000000..a197d91a13
+index 0000000000..873697777f
 --- /dev/null
 +++ b/mm/lru_marie/state.h
-@@ -0,0 +1,1213 @@
+@@ -0,0 +1,1255 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _MM_LRU_MARIE_STATE_H
 +#define _MM_LRU_MARIE_STATE_H
@@ -5863,6 +5905,18 @@ index 0000000000..a197d91a13
 +#define MARIE_CONCEDE_REFAULT	0x2
 +extern unsigned int marie_concede_pressure_mode;
 +extern atomic_long_t marie_dbg_concede[4];	/* [floor,free,refault,memcg] */
++
++/*
++ * ignore_refs attribution.
++ *
++ * One condition tells shrink_folio_list to skip folio_check_references for the
++ * batch isolated from the oldest gen: the walker has completed an aging pass
++ * over this gen since the head recycled it, so aging already declined to
++ * promote these folios and the reference state left behind is stale. Counted
++ * per type, against the batches where it did not hold and references were
++ * therefore respected.
++ */
++extern atomic_long_t marie_dbg_ignore_refs[2][2];	/* [forced,respected][type] */
 +
 +/*
 + * Marie per-PFN state — paradigm specification.
@@ -6153,6 +6207,26 @@ index 0000000000..a197d91a13
 +extern atomic_long_t marie_gen_occupied[MARIE_PFN_NR_GENS][2 /* ANON_AND_FILE */];
 +
 +/*
++ * How many of this type's generations currently hold anything, maintained
++ * incrementally by the marie_gen_occ_inc/dec choke point below rather than
++ * derived by scanning all NR_GENS counters.
++ *
++ * The value only moves when a generation crosses 0 <-> non-zero, which happens
++ * a handful of times per lap, so keeping it is near-free while reading it is a
++ * single atomic_read -- as opposed to NR_GENS reads of the hottest, most
++ * contended cachelines Marie has (every install and every eviction writes
++ * marie_gen_occupied). That matters because the install cadence is a hot path
++ * and this is the input a ring-occupancy-aware growth threshold would need
++ * live rather than sampled once per head advance.
++ *
++ * Note it counts OCCUPIED generations, which is not the same as the span from
++ * the head back to the oldest occupied one: a generation in the middle can
++ * empty out when its last folio is promoted to the head or freed, and
++ * marie_find_oldest_occupied_mlv skips such holes by design.
++ */
++extern atomic_t marie_nr_occupied_gens[2 /* ANON_AND_FILE */];
++
++/*
 + * gen_occupancy abstraction -- the SINGLE interface for "a folio entered /
 + * left gen @g of @type". EVERY per-PFN gen-transition site routes its
 + * occupancy bookkeeping through here: the install/split publisher
@@ -6174,13 +6248,23 @@ index 0000000000..a197d91a13
 + */
 +static inline void marie_gen_occ_inc(unsigned long pfn, int gen, int type)
 +{
-+	atomic_long_inc(&marie_gen_occupied[gen][type]);
++	/*
++	 * *_return rather than a bare inc/dec so the 0 <-> non-zero crossing can
++	 * be detected: both are the same locked RMW on the same cacheline (lock
++	 * xadd instead of lock inc on x86), so the occupied-generation tally
++	 * costs a register add on the common path and one extra atomic on the
++	 * rare crossing. Exactly one caller observes each crossing, so the tally
++	 * needs no lock of its own.
++	 */
++	if (atomic_long_inc_return(&marie_gen_occupied[gen][type]) == 1)
++		atomic_inc(&marie_nr_occupied_gens[type]);
 +	marie_defrag_hist_inc(pfn, gen, type);
 +}
 +
 +static inline void marie_gen_occ_dec(unsigned long pfn, int gen, int type)
 +{
-+	atomic_long_dec(&marie_gen_occupied[gen][type]);
++	if (atomic_long_dec_return(&marie_gen_occupied[gen][type]) == 0)
++		atomic_dec(&marie_nr_occupied_gens[type]);
 +	marie_defrag_hist_dec(pfn, gen, type);
 +}
 +
@@ -7146,10 +7230,10 @@ index 0000000000..4d07cedd9c
 +#endif /* _MM_LRU_MARIE_STATE_COMPAT_H */
 diff --git a/mm/lru_marie/state_core.c b/mm/lru_marie/state_core.c
 new file mode 100644
-index 0000000000..7386c8de5f
+index 0000000000..955c4cb143
 --- /dev/null
 +++ b/mm/lru_marie/state_core.c
-@@ -0,0 +1,824 @@
+@@ -0,0 +1,830 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Marie per-PFN state array — allocation, init, global counters, and the
@@ -7231,6 +7315,12 @@ index 0000000000..7386c8de5f
 + * by marie_file_floor_protect.
 + */
 +atomic_long_t marie_gen_occupied[MARIE_PFN_NR_GENS][2];
++
++/*
++ * Count of the above that are non-zero, per type. See state.h for why it is
++ * maintained at the choke point instead of being derived on demand.
++ */
++atomic_t marie_nr_occupied_gens[2];
 +
 +/*
 + * Global aging epoch, bumped once per walker pass per type. The global aging
@@ -8569,10 +8659,10 @@ index 0000000000..684c8521e6
 +}
 diff --git a/mm/lru_marie/state_reclaim.c b/mm/lru_marie/state_reclaim.c
 new file mode 100644
-index 0000000000..810c2e8315
+index 0000000000..43c310acf2
 --- /dev/null
 +++ b/mm/lru_marie/state_reclaim.c
-@@ -0,0 +1,1852 @@
+@@ -0,0 +1,1908 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Marie reclaim engine: the PTE-walker-independent scan/isolate loop,
@@ -9219,6 +9309,9 @@ index 0000000000..810c2e8315
 +/* Concede-trigger attribution: [0]=floor [1]=free-pressure [2]=refault [3]=memcg. */
 +atomic_long_t marie_dbg_concede[4];
 +
++/* ignore_refs attribution: [0]=forced (epoch), [1]=references respected. */
++atomic_long_t marie_dbg_ignore_refs[2][2];
++
 +/*
 + * GLOBAL anon-vs-file proportional pick bias (desktop/global-only). Signed:
 + * < 0 favours FILE, >= 0 favours ANON. A single node-wide controller drives
@@ -9820,48 +9913,51 @@ index 0000000000..810c2e8315
 +				break;
 +			}
 +			/*
-+			 * Force-reclaim referenced folios at the oldest gen once
-+			 * the walker has swept it since the head recycled it: the
-+			 * aging epoch has moved past the recycle stamp.
++			 * Force-reclaim referenced folios at the oldest gen once the
++			 * walker has swept it since the head recycled it: the aging
++			 * epoch has moved past the recycle stamp, so aging already
++			 * declined to promote them and the reference state left behind
++			 * is stale evidence. Bounded and evidence-based -- it goes
++			 * false again the moment the head recycles this gen.
++			 *
++			 * This is the only condition. swappiness <= 1 with clean file
++			 * above the clean_min_ratio floor used to force it on for FILE
++			 * as well, so that a workload re-reading its pagecache could
++			 * not defeat the file-preference contract by keeping the
++			 * reference signal set. That was a compensation for two defects
++			 * that no longer exist: the walker was bloom-gated and could not
++			 * see memory reclaim had never touched, and folio_mark_accessed()
++			 * returned early under Marie so PG_referenced was never set on
++			 * unmapped pagecache. Hot file therefore had no route to the head
++			 * gen and this backstop had no aging to defer to. Both are fixed,
++			 * so hot file is promoted out of the oldest gen and never reaches
++			 * this scan, and cold clean file still scores
++			 * FOLIOREF_RECLAIM_CLEAN and drains without an override.
++			 *
++			 * It was also unsound to keep. The two conditions wrote the same
++			 * flag, but this one is a gate that opens and closes with the
++			 * aging clock while the policy term was a latch: once swappiness
++			 * <= 1 and file sat above the floor it was true for every batch,
++			 * forever, which defeated the boundedness this comment relies on.
++			 * Its blast radius also exceeded the contract it claimed to
++			 * enforce -- "evict file rather than swap anon" was suppressing
++			 * the VM_EXEC ACTIVATE branch, i.e. evicting the text of running
++			 * programs. And the swappiness contract is already expressed one
++			 * layer up, in the pick cascade; this was that policy leaking
++			 * down into per-folio judgement.
++			 *
++			 * Measured redundant before removal, on a live 30 GiB desktop
++			 * over an hour of ordinary use: of 13271 FILE batches the epoch
++			 * term held on 13271 and the policy term on the same 13271, with
++			 * 0 batches where neither did. QEMU agreed (852 vs 865 of the
++			 * same batches), and an A/B over both arms was indistinguishable.
++			 * Whichever way the flag is set, it is set.
 +			 */
 +			ignore_refs =
 +				(s32)(atomic_read(&marie_aging_epoch[type]) -
 +				      READ_ONCE(marie_recycle_epoch[oldest][type])) > 0;
 +
-+			/*
-+			 * File-preference policy contract (swappiness <= 1):
-+			 * while clean file is ABOVE the clean_min_ratio floor,
-+			 * reclaim it in PREFERENCE to swapping anon -- including
-+			 * REFERENCED clean file. Under a workload that keeps
-+			 * reading its pagecache (PG_referenced set), the
-+			 * walker-gated ignore_refs above is mostly false, so
-+			 * folio_check_references rotates that file and the FILE
-+			 * pass falls short -> concedes to anon while GBs of
-+			 * reclaimable clean file sit far above the floor (the
-+			 * nibble; measured file ~5x the floor with pgscan_file ~=
-+			 * 2x pgsteal_file). Re-reading rotated file from disk is
-+			 * the accepted cost of a file-preference policy, so FORCE
-+			 * ignore_refs. The live floor check stops it the moment
-+			 * file reaches the reserve, protecting the working-set
-+			 * reserve below the floor.
-+			 *
-+			 * swappiness <= 1 captures both file-only POLICY regimes:
-+			 *   0 -> never swap anon (FILE_STRICT)
-+			 *   1 -> drain file to the floor before anon (FILE_THEN_ANON)
-+			 * Both are the user's explicit choice to evict file over
-+			 * swapping anon, so the referenced-file rotation cost is
-+			 * accepted. swappiness >= 2 is NOT forced: the proportional
-+			 * bias already routes pressure to anon when file is hard to
-+			 * reclaim, and force-evicting the working set there would
-+			 * thrash (refault) instead. anon_unreclaimable is likewise
-+			 * NOT forced -- it is a circumstance, not a policy; the
-+			 * default reference-respecting reclaim + epoch backstop are
-+			 * the right (gentle) handling near OOM, and forcing would
-+			 * only add refault thrash to a doomed system.
-+			 */
-+			if (type == 1 && swappiness <= 1 &&
-+			    !marie_file_floor_protect(pgdat))
-+				ignore_refs = true;
++			atomic_long_inc(&marie_dbg_ignore_refs[ignore_refs ? 0 : 1][type]);
 +
 +			/*
 +			 * Throttle before isolating: if other concurrent
@@ -9906,14 +10002,23 @@ index 0000000000..810c2e8315
 +			 * scratch_batch[0..] in a SINGLE call: there is only
 +			 * one invocation per type per swept gen here (tier no
 +			 * longer exists as a scan dimension -- see state.h's
-+			 * byte-layout block), so the old cross-call "hard/soft
++			 * byte-layout block), so the old CROSS-CALL "hard/soft
 +			 * ceiling" accumulator checks that used to bound
-+			 * repeated isolate calls within one sweep step no
-+			 * longer have anything to accumulate against (n_taken
-+			 * / n_taken_pages are freshly reset to 0 above every
-+			 * sweep_i iteration) and are removed rather than kept
-+			 * as permanently-false conditions. array_cap itself
-+			 * still bounds this single call's batch_size.
++			 * repeated isolate calls within one sweep step do not
++			 * have anything to accumulate against any more
++			 * (n_taken / n_taken_pages are freshly reset to 0
++			 * above every sweep_i iteration).
++			 *
++			 * The soft ceiling itself is NOT moot, though, and
++			 * deleting it along with the accumulator was a
++			 * regression: array_cap is a FOLIO count, so it alone
++			 * lets one pass isolate 8192 folios -- 32 MiB at
++			 * order-0 and far more with large folios -- at any
++			 * priority, including the gentle first pass where
++			 * marie_pfn_batch_threshold() asks for 256 pages. It
++			 * is re-applied below in the claim loop, the one place
++			 * that can still enforce it now that there is nothing
++			 * between calls to enforce it in.
 +			 *
 +			 * Failed claims (try_get / test_clear_lru) leave
 +			 * the corresponding scratch_batch slot to be
@@ -9927,12 +10032,45 @@ index 0000000000..810c2e8315
 +				if (sc_reclaim_target_reached(sc))
 +					goto done;
 +
++				/*
++				 * Bound the walk by the page budget as well as
++				 * by the array. Every folio is at least one
++				 * page, so batch_max folios can never yield
++				 * fewer pages than batch_max; this only stops
++				 * the bitmap walk from filling 8192 slots that
++				 * the claim loop below will abandon after a
++				 * few hundred pages.
++				 */
 +				nr_isolated = marie_state_isolate_scan_l2lock(
 +					pgdat, type, sc_reclaim_idx(sc),
-+					&scratch_batch[n_taken], array_cap,
++					&scratch_batch[n_taken],
++					min(array_cap, batch_max),
 +					ULONG_MAX, oldest);
 +
 +				for (i = 0; i < nr_isolated; i++) {
++					/*
++					 * Soft PAGE-count budget: cap the
++					 * memory this pass takes off the LRU,
++					 * not the folio count -- one THP is
++					 * 512 pages, so a folio ceiling is not
++					 * a bound on anything the caller asked
++					 * for. batch_max is
++					 * marie_pfn_batch_threshold(sc): 256
++					 * pages at DEF_PRIORITY, scaling to
++					 * array_cap only as priority falls.
++					 *
++					 * Checked before claiming rather than
++					 * after, so a batch overshoots by at
++					 * most the one folio that crosses the
++					 * line. Folios left unclaimed in
++					 * scratch_batch need no cleanup: the
++					 * scan only stored pointers, and it is
++					 * this loop that takes the reference,
++					 * clears PG_lru and moves the
++					 * counters.
++					 */
++					if (n_taken_pages >= batch_max)
++						break;
 +					f = scratch_batch[n_taken + i];
 +					if (!folio_try_get(f))
 +						continue;
@@ -10318,8 +10456,11 @@ index 0000000000..810c2e8315
 +			 *      reclaimable this call. The remedy depends only on
 +			 *      the floor: while clean file is still ABOVE
 +			 *      clean_min_ratio, DEFER -- successive file-only
-+			 *      calls drain it (forced ignore_refs makes even
-+			 *      referenced clean file reclaimable). Once file is at
++			 *      calls drain it: cold clean file scores
++			 *      FOLIOREF_RECLAIM_CLEAN, so it drains with no
++			 *      reference override, and a pass that still falls
++			 *      short escapes through the free/refault/memcg
++			 *      terms below. Once file is at
 +			 *      the floor, CONCEDE to anon -- the file reserve is
 +			 *      protected and swapping anon is the OOM-with-swap-
 +			 *      free safety; the pick flips to ANON_STRICT next
@@ -10363,9 +10504,14 @@ index 0000000000..810c2e8315
 +				 *   anon; the per-call sweep is batch-capped, so a
 +				 *   large target is met across successive file-only
 +				 *   calls, not by conceding to anon while reclaimable
-+				 *   file sits above the floor (forced ignore_refs makes
-+				 *   even referenced clean file reclaimable, so this is
-+				 *   not a rotation treadmill). memcg-targeted reclaim
++				 *   file sits above the floor. This is not a rotation
++				 *   treadmill: cold clean file scores
++				 *   FOLIOREF_RECLAIM_CLEAN and drains without a
++				 *   reference override, referenced file that the walker
++				 *   has already judged is force-reclaimed by the epoch
++				 *   backstop above, and anything still short escapes
++				 *   via the free and refault terms rather than by
++				 *   force-evicting mapped file. memcg-targeted reclaim
 +				 *   that made no file progress is the exception -- it
 +				 *   concedes so the limited memcg makes progress.
 +				 *
@@ -10427,7 +10573,7 @@ index 0000000000..810c2e8315
 +}
 diff --git a/mm/lru_marie/version.h b/mm/lru_marie/version.h
 new file mode 100644
-index 0000000000..107746704d
+index 0000000000..0cfe209c55
 --- /dev/null
 +++ b/mm/lru_marie/version.h
 @@ -0,0 +1,22 @@
@@ -10450,7 +10596,7 @@ index 0000000000..107746704d
 +#define MARIE_PROGNAME	"Marie LRU"
 +#define MARIE_AUTHOR	"Masahito Suzuki"
 +
-+#define MARIE_VERSION	"0.10.1"
++#define MARIE_VERSION	"0.10.5"
 +
 +#endif /* _MM_LRU_MARIE_VERSION_H */
 diff --git a/mm/lru_marie/walker.c b/mm/lru_marie/walker.c
