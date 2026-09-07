@@ -1,11 +1,11 @@
-From 2389f892c215303cc7272232511bfcf509b6c59a Mon Sep 17 00:00:00 2001
+From 35f3da5ad4569469c9755ababa4efb752d123eab Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Mon, 31 Aug 2026 03:57:14 +0900
-Subject: [PATCH] linux7.1-rc5-lru_marie-0.11.0
+Date: Tue, 8 Sep 2026 01:03:26 +0900
+Subject: [PATCH] linux7.2-rc1-lru_marie-0.11.1
 
 ---
  include/linux/lru_marie.h      |  488 ++++++++
- include/linux/memcontrol.h     |   26 +-
+ include/linux/memcontrol.h     |   31 +-
  include/linux/mm_inline.h      |  103 +-
  include/linux/mmzone.h         |   15 +
  include/linux/swap.h           |   18 +
@@ -41,15 +41,15 @@ Subject: [PATCH] linux7.1-rc5-lru_marie-0.11.0
  mm/memcontrol-v1.c             |   11 +
  mm/memcontrol.c                |   21 +
  mm/mm_init.c                   |    3 +
- mm/oom_kill.c                  |  327 ++++++
+ mm/oom_kill.c                  |  365 ++++++
  mm/page_alloc.c                |  120 +-
  mm/page_io.c                   |  331 ++++++
  mm/page_isolation.c            |   31 +-
  mm/rmap.c                      |    6 +
- mm/swap.c                      |  262 ++++-
+ mm/swap.c                      |  272 ++++-
  mm/swap.h                      |    4 +
  mm/vmscan.c                    |  513 +++++++-
- 45 files changed, 13769 insertions(+), 33 deletions(-)
+ 45 files changed, 13822 insertions(+), 33 deletions(-)
  create mode 100644 include/linux/lru_marie.h
  create mode 100644 mm/lru_marie/Makefile
  create mode 100644 mm/lru_marie/account.h
@@ -571,13 +571,18 @@ index 0000000000..afdceacc4e
 +
 +#endif /* _LINUX_LRU_MARIE_H */
 diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
-index dc3fa68775..bde5bd78ff 100644
+index e1f46a0016..94924f359d 100644
 --- a/include/linux/memcontrol.h
 +++ b/include/linux/memcontrol.h
-@@ -880,14 +880,38 @@ static inline bool mem_cgroup_online(struct mem_cgroup *memcg)
- void mem_cgroup_update_lru_size(struct lruvec *lruvec, enum lru_list lru,
- 		int zid, long nr_pages);
+@@ -365,6 +365,30 @@ enum objext_flags {
  
+ #define OBJEXTS_FLAGS_MASK (__NR_OBJEXTS_FLAGS - 1)
+ 
++/*
++ * Declared outside the CONFIG_MEMCG branches on purpose: the definition in
++ * mm/lru_marie/core.c is unconditional under CONFIG_LRU_MARIE, and x86_64
++ * defconfig builds with CONFIG_MEMCG=n (-Wmissing-prototypes otherwise).
++ */
 +#ifdef CONFIG_LRU_MARIE
 +/*
 + * Out-of-line (lru_marie_enabled()'s static key lives in lru_marie.h, which
@@ -597,8 +602,10 @@ index dc3fa68775..bde5bd78ff 100644
 +				       int zone_idx, unsigned long stock);
 +#endif
 +
- static inline
- unsigned long mem_cgroup_get_zone_lru_size(struct lruvec *lruvec,
+ #ifdef CONFIG_MEMCG
+ /*
+  * After the initialization objcg->memcg is always pointing at
+@@ -882,9 +906,14 @@ unsigned long mem_cgroup_get_zone_lru_size(struct lruvec *lruvec,
  		enum lru_list lru, int zone_idx)
  {
  	struct mem_cgroup_per_node *mz;
@@ -615,7 +622,7 @@ index dc3fa68775..bde5bd78ff 100644
  
  void __mem_cgroup_handle_over_high(gfp_t gfp_mask);
 diff --git a/include/linux/mm_inline.h b/include/linux/mm_inline.h
-index a171070e15..4779a3b6b9 100644
+index a8430a7ae0..da6659f066 100644
 --- a/include/linux/mm_inline.h
 +++ b/include/linux/mm_inline.h
 @@ -5,6 +5,7 @@
@@ -801,7 +808,7 @@ index a171070e15..4779a3b6b9 100644
  		return;
  
 diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
-index 9adb2ad21d..3dd56a3add 100644
+index ca27121871..9430caa4a0 100644
 --- a/include/linux/mmzone.h
 +++ b/include/linux/mmzone.h
 @@ -24,6 +24,7 @@
@@ -812,7 +819,7 @@ index 9adb2ad21d..3dd56a3add 100644
  #include <asm/page.h>
  
  /* Free memory management - zoned buddy allocator.  */
-@@ -1529,6 +1530,20 @@ typedef struct pglist_data {
+@@ -1522,6 +1523,20 @@ typedef struct pglist_data {
  
  	atomic_t kswapd_failures;	/* Number of 'reclaimed == 0' runs */
  
@@ -834,7 +841,7 @@ index 9adb2ad21d..3dd56a3add 100644
  	int kcompactd_max_order;
  	enum zone_type kcompactd_highest_zoneidx;
 diff --git a/include/linux/swap.h b/include/linux/swap.h
-index 7a09df6977..cb9d9acecb 100644
+index 8f0f68e245..66eaf4f962 100644
 --- a/include/linux/swap.h
 +++ b/include/linux/swap.h
 @@ -421,6 +421,24 @@ extern atomic_long_t nr_swap_pages;
@@ -863,10 +870,10 @@ index 7a09df6977..cb9d9acecb 100644
  static inline bool vm_swap_full(void)
  {
 diff --git a/mm/Kconfig b/mm/Kconfig
-index e8bf1e9e6a..dd89a8a3e0 100644
+index 9e0ca48249..a604fddd62 100644
 --- a/mm/Kconfig
 +++ b/mm/Kconfig
-@@ -1396,6 +1396,78 @@ config LRU_GEN_WALKS_MMU
+@@ -1435,6 +1435,78 @@ config LRU_GEN_WALKS_MMU
  	depends on LRU_GEN && ARCH_HAS_HW_PTE_YOUNG
  # }
  
@@ -946,7 +953,7 @@ index e8bf1e9e6a..dd89a8a3e0 100644
         def_bool n
  
 diff --git a/mm/Makefile b/mm/Makefile
-index 8ad2ab0824..1f8385ecee 100644
+index eff9f9e7e0..b82d9b6ac3 100644
 --- a/mm/Makefile
 +++ b/mm/Makefile
 @@ -76,6 +76,7 @@ ifdef CONFIG_MMU
@@ -958,7 +965,7 @@ index 8ad2ab0824..1f8385ecee 100644
  obj-$(CONFIG_HAS_DMA)	+= dmapool.o
  obj-$(CONFIG_HUGETLBFS)	+= hugetlb.o hugetlb_sysfs.o hugetlb_sysctl.o
 diff --git a/mm/compaction.c b/mm/compaction.c
-index 3648ce22c8..3f0f769c1d 100644
+index b776f35ad0..35e49b17dc 100644
 --- a/mm/compaction.c
 +++ b/mm/compaction.c
 @@ -24,6 +24,7 @@
@@ -969,7 +976,7 @@ index 3648ce22c8..3f0f769c1d 100644
  #include "internal.h"
  
  #ifdef CONFIG_COMPACTION
-@@ -3092,6 +3093,23 @@ static void kcompactd_do_work(pg_data_t *pgdat)
+@@ -3097,6 +3098,23 @@ static void kcompactd_do_work(pg_data_t *pgdat)
  							cc.highest_zoneidx);
  	count_compact_event(KCOMPACTD_WAKE);
  
@@ -993,7 +1000,7 @@ index 3648ce22c8..3f0f769c1d 100644
  	for (zoneid = 0; zoneid <= cc.highest_zoneidx; zoneid++) {
  		int status;
  
-@@ -3228,7 +3246,19 @@ static int kcompactd(void *p)
+@@ -3233,7 +3251,19 @@ static int kcompactd(void *p)
  			unsigned int prev_score, score;
  
  			prev_score = fragmentation_score_node(pgdat);
@@ -1015,7 +1022,7 @@ index 3648ce22c8..3f0f769c1d 100644
  			/*
  			 * Defer proactive compaction if the fragmentation
 diff --git a/mm/huge_memory.c b/mm/huge_memory.c
-index 970e077019..8ba88176e3 100644
+index 2bccb0a53a..31ffbe3610 100644
 --- a/mm/huge_memory.c
 +++ b/mm/huge_memory.c
 @@ -6,6 +6,7 @@
@@ -1026,7 +1033,7 @@ index 970e077019..8ba88176e3 100644
  #include <linux/sched.h>
  #include <linux/sched/mm.h>
  #include <linux/sched/numa_balancing.h>
-@@ -3558,14 +3559,48 @@ static void lru_add_split_folio(struct folio *folio, struct folio *new_folio,
+@@ -3500,14 +3501,48 @@ static void lru_add_split_folio(struct folio *folio, struct folio *new_folio,
  		/* page reclaim is reclaiming a huge page */
  		VM_WARN_ON(folio_test_lru(folio));
  		folio_get(new_folio);
@@ -1078,7 +1085,7 @@ index 970e077019..8ba88176e3 100644
  	}
  }
 diff --git a/mm/internal.h b/mm/internal.h
-index 5a2ddcf68e..0368afc31c 100644
+index 181e79f1d6..0854f6ddd7 100644
 --- a/mm/internal.h
 +++ b/mm/internal.h
 @@ -12,6 +12,7 @@
@@ -1089,7 +1096,7 @@ index 5a2ddcf68e..0368afc31c 100644
  #include <linux/pagemap.h>
  #include <linux/pagewalk.h>
  #include <linux/rmap.h>
-@@ -625,12 +626,67 @@ extern unsigned long highest_memmap_pfn;
+@@ -616,12 +617,67 @@ extern unsigned long highest_memmap_pfn;
   */
  #define MAX_RECLAIM_RETRIES 16
  
@@ -1157,7 +1164,7 @@ index 5a2ddcf68e..0368afc31c 100644
  int user_proactive_reclaim(char *buf,
  			   struct mem_cgroup *memcg, pg_data_t *pgdat);
  
-@@ -693,6 +749,30 @@ struct alloc_context {
+@@ -684,6 +740,30 @@ struct alloc_context {
  	 */
  	enum zone_type highest_zoneidx;
  	bool spread_dirty_pages;
@@ -11432,7 +11439,7 @@ index 0000000000..5731815039
 +}
 diff --git a/mm/lru_marie/version.h b/mm/lru_marie/version.h
 new file mode 100644
-index 0000000000..5e45dfff57
+index 0000000000..fa3edd405c
 --- /dev/null
 +++ b/mm/lru_marie/version.h
 @@ -0,0 +1,22 @@
@@ -11455,7 +11462,7 @@ index 0000000000..5e45dfff57
 +#define MARIE_PROGNAME	"Marie LRU"
 +#define MARIE_AUTHOR	"Masahito Suzuki"
 +
-+#define MARIE_VERSION	"0.11.0"
++#define MARIE_VERSION	"0.11.1"
 +
 +#endif /* _MM_LRU_MARIE_VERSION_H */
 diff --git a/mm/lru_marie/walker.c b/mm/lru_marie/walker.c
@@ -12632,10 +12639,10 @@ index 0000000000..131018c2ea
 +
 +#endif /* _MM_LRU_MARIE_WALKER_COMPAT_H */
 diff --git a/mm/memcontrol-v1.c b/mm/memcontrol-v1.c
-index 433bba9dfe..a7923ef2fa 100644
+index 7650692115..16636e0d43 100644
 --- a/mm/memcontrol-v1.c
 +++ b/mm/memcontrol-v1.c
-@@ -11,6 +11,7 @@
+@@ -10,6 +10,7 @@
  #include <linux/sort.h>
  #include <linux/file.h>
  #include <linux/seq_buf.h>
@@ -12643,7 +12650,7 @@ index 433bba9dfe..a7923ef2fa 100644
  
  #include "internal.h"
  #include "swap.h"
-@@ -2000,6 +2001,16 @@ static int mem_cgroup_swappiness_write(struct cgroup_subsys_state *css,
+@@ -2020,6 +2021,16 @@ static int mem_cgroup_swappiness_write(struct cgroup_subsys_state *css,
  	} else
  		WRITE_ONCE(vm_swappiness, val);
  
@@ -12661,7 +12668,7 @@ index 433bba9dfe..a7923ef2fa 100644
  }
  
 diff --git a/mm/memcontrol.c b/mm/memcontrol.c
-index 749c128b4f..12756d8863 100644
+index 6dc4888a90..b00c2ee52d 100644
 --- a/mm/memcontrol.c
 +++ b/mm/memcontrol.c
 @@ -28,6 +28,7 @@
@@ -12672,7 +12679,7 @@ index 749c128b4f..12756d8863 100644
  #include <linux/cgroup.h>
  #include <linux/cpuset.h>
  #include <linux/sched/mm.h>
-@@ -5178,6 +5179,26 @@ static void uncharge_folio(struct folio *folio, struct uncharge_gather *ug)
+@@ -5287,6 +5288,26 @@ static void uncharge_folio(struct folio *folio, struct uncharge_gather *ug)
  			ug->nr_memory += nr_pages;
  		ug->pgpgout++;
  
@@ -12700,7 +12707,7 @@ index 749c128b4f..12756d8863 100644
  	}
  
 diff --git a/mm/mm_init.c b/mm/mm_init.c
-index f9f8e1af92..aae01205e5 100644
+index 0f64909e8d..b8c8f26987 100644
 --- a/mm/mm_init.c
 +++ b/mm/mm_init.c
 @@ -1395,6 +1395,9 @@ static void __meminit pgdat_init_internals(struct pglist_data *pgdat)
@@ -12714,7 +12721,7 @@ index f9f8e1af92..aae01205e5 100644
  
  	for (i = 0; i < NR_VMSCAN_THROTTLE; i++)
 diff --git a/mm/oom_kill.c b/mm/oom_kill.c
-index 5f372f6e26..35204918bd 100644
+index 5f372f6e26..39dd22dcd9 100644
 --- a/mm/oom_kill.c
 +++ b/mm/oom_kill.c
 @@ -45,6 +45,10 @@
@@ -12764,7 +12771,7 @@ index 5f372f6e26..35204918bd 100644
  };
  #endif
  
-@@ -1255,3 +1281,304 @@ SYSCALL_DEFINE2(process_mrelease, int, pidfd, unsigned int, flags)
+@@ -1255,3 +1281,342 @@ SYSCALL_DEFINE2(process_mrelease, int, pidfd, unsigned int, flags)
  	return -ENOSYS;
  #endif /* CONFIG_MMU */
  }
@@ -12887,10 +12894,11 @@ index 5f372f6e26..35204918bd 100644
 +		 * >= half refault, real memory
 +		 * pressure -- but no PSI ring (warm-up is one window, not five)
 +		 * and a severity-WEIGHTED accumulator rather than a flat window
-+		 * count: each treadmill window adds w in [1..THRASH_WD_SCORE]
++		 * count: each treadmill window adds w in [1..THRASH_WD_SCORE/2]
 +		 * scaled by how badly the box is losing, so a severe treadmill
 +		 * (near-zero NET progress AND free in the reserves) reaches the
-+		 * threshold in a single ~2s window, while a marginal one still
++		 * threshold in two ~2s windows -- the cap is half the threshold,
++		 * so no single sample can ever OOM -- while a marginal one still
 +		 * needs the full THRASH_WD_SCORE windows (== the classic 16s: no
 +		 * regression at the mild end). Honest net-progress: any window
 +		 * where reclaim actually lifted free (real headroom) resets the
@@ -12949,11 +12957,48 @@ index 5f372f6e26..35204918bd 100644
 +				 */
 +				hot_windows = 0;
 +			} else {
-+				/* free <= high is guaranteed by the escape above
-+				 * (base 2 folds in the old "below high wmark" +1). */
-+				w = 2;
-+				if (dr >= ds)		w += 3;	/* ~zero net progress */
-+				if (free <= min * 2)	w += 3;	/* into the reserves */
++				/*
++				 * free <= high is guaranteed by the escape above,
++				 * so both severity terms must say something that
++				 * arming does not. The reserves term did not.
++				 *
++				 * high is min + 2 * gap, gap = max(min / 4, managed *
++				 * watermark_scale_factor / 10000). At the default
++				 * scale factor of 10 the gap collapses to min / 4 --
++				 * and high to 1.5 * min -- once min_free_kbytes is
++				 * more than ~0.2% of RAM, which is where any tuned
++				 * desktop sits. "free <= min * 2" is then implied by
++				 * "free <= high": every armed window scored the full
++				 * 2 + 3 + 3 == THRASH_WD_SCORE and fired immediately,
++				 * so the ladder this path exists for degenerated into
++				 * "OOM on the first 2s sample". Measured, Sum() over
++				 * populated zones: 32 GiB with min_free_kbytes=256M ->
++				 * high 98301 vs 2*min 131070; 30 GiB with 66M ->
++				 * 32809 vs 33790. Both collapsed. The first is the
++				 * reported case: a parallel build was killed 57 pages
++				 * below high, one window after the ratio first tipped,
++				 * with 3.3 GB of reclaimable file cache still resident
++				 * and 65 GB of free swap.
++				 *
++				 * Reserves now means the reserves: free at or below
++				 * the min watermark, where allocation is into what
++				 * only ALLOC_HARDER may spend. high > min always, so
++				 * this is strictly inside the armed band by
++				 * construction and cannot be implied by it again.
++				 *
++				 * The weights are halved with that fix so the maximum
++				 * single-window score is THRASH_WD_SCORE / 2: two
++				 * windows minimum before any kill, at any severity. A
++				 * 2s sample cannot tell a burst from a treadmill --
++				 * the reported dr/ds tipped for exactly one window --
++				 * and the freeze this guards against is minutes long,
++				 * so 4s costs nothing to catch it. The mildest window
++				 * is back to 1, restoring the full 8-window / 16s
++				 * classic floor that a base of 2 had quietly halved.
++				 */
++				w = 1;
++				if (dr >= ds)		w += 2;	/* ~zero net progress */
++				if (free <= min)	w += 1;	/* into the reserves */
 +				hot_windows += w;
 +				if (hot_windows >= THRASH_WD_SCORE) {
 +					scnprintf(reason, sizeof(reason),
@@ -13070,7 +13115,7 @@ index 5f372f6e26..35204918bd 100644
 +}
 +late_initcall(thrash_wd_init);
 diff --git a/mm/page_alloc.c b/mm/page_alloc.c
-index 23c7298d3b..31d110475b 100644
+index ee902a468c..04c93a3b9a 100644
 --- a/mm/page_alloc.c
 +++ b/mm/page_alloc.c
 @@ -16,6 +16,7 @@
@@ -13081,7 +13126,7 @@ index 23c7298d3b..31d110475b 100644
  #include <linux/highmem.h>
  #include <linux/interrupt.h>
  #include <linux/jiffies.h>
-@@ -1314,6 +1315,28 @@ __always_inline bool __free_pages_prepare(struct page *page,
+@@ -1326,6 +1327,28 @@ static __always_inline bool __free_pages_prepare(struct page *page,
  	trace_mm_page_free(page, order);
  	kmsan_free_page(page, order);
  
@@ -13110,7 +13155,7 @@ index 23c7298d3b..31d110475b 100644
  	if (memcg_kmem_online() && PageMemcgKmem(page))
  		__memcg_kmem_uncharge_page(page, order);
  
-@@ -4576,25 +4599,97 @@ bool gfp_pfmemalloc_allowed(gfp_t gfp_mask)
+@@ -4580,25 +4603,97 @@ bool gfp_pfmemalloc_allowed(gfp_t gfp_mask)
  static inline bool
  should_reclaim_retry(gfp_t gfp_mask, unsigned order,
  		     struct alloc_context *ac, int alloc_flags,
@@ -13211,7 +13256,7 @@ index 23c7298d3b..31d110475b 100644
  
  	/*
  	 * Keep reclaiming pages while there is a chance this will lead
-@@ -4718,6 +4813,20 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+@@ -4757,6 +4852,20 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
  		WARN_ON_ONCE(current->flags & PF_MEMALLOC);
  	}
  
@@ -13232,7 +13277,7 @@ index 23c7298d3b..31d110475b 100644
  restart:
  	compaction_retries = 0;
  	no_progress_loops = 0;
-@@ -4725,6 +4834,9 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+@@ -4764,6 +4873,9 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
  	compact_priority = DEF_COMPACT_PRIORITY;
  	cpuset_mems_cookie = read_mems_allowed_begin();
  	zonelist_iter_cookie = zonelist_iter_begin();
@@ -13242,7 +13287,7 @@ index 23c7298d3b..31d110475b 100644
  
  	/*
  	 * For costly allocations, try direct compaction first, as it's likely
-@@ -4881,7 +4993,7 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+@@ -4934,7 +5046,7 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
  		goto restart;
  
  	if (should_reclaim_retry(gfp_mask, order, ac, alloc_flags,
@@ -13252,16 +13297,17 @@ index 23c7298d3b..31d110475b 100644
  
  	/*
 diff --git a/mm/page_io.c b/mm/page_io.c
-index 70cea9e24d..b998d02b5a 100644
+index b23f494fcc..3c4c92858c 100644
 --- a/mm/page_io.c
 +++ b/mm/page_io.c
-@@ -25,8 +25,19 @@
+@@ -25,9 +25,20 @@
  #include <linux/sched/task.h>
  #include <linux/delayacct.h>
  #include <linux/zswap.h>
 +#include <linux/kfifo.h>
 +#include <linux/lru_marie.h>
  #include "swap.h"
+ #include "swap_table.h"
  
 +#ifdef CONFIG_LRU_MARIE
 +/*
@@ -13275,7 +13321,7 @@ index 70cea9e24d..b998d02b5a 100644
  static void __end_swap_bio_write(struct bio *bio)
  {
  	struct folio *folio = bio_first_folio_all(bio);
-@@ -39,7 +50,21 @@ static void __end_swap_bio_write(struct bio *bio)
+@@ -40,7 +51,21 @@ static void __end_swap_bio_write(struct bio *bio)
  		 * very quickly.
  		 *
  		 * Also clear PG_reclaim to avoid folio_rotate_reclaimable()
@@ -13297,7 +13343,7 @@ index 70cea9e24d..b998d02b5a 100644
  		folio_mark_dirty(folio);
  		pr_alert_ratelimited("Write-error on swap-device (%u:%u:%llu)\n",
  				     MAJOR(bio_dev(bio)), MINOR(bio_dev(bio)),
-@@ -49,6 +74,28 @@ static void __end_swap_bio_write(struct bio *bio)
+@@ -50,6 +75,28 @@ static void __end_swap_bio_write(struct bio *bio)
  	folio_end_writeback(folio);
  }
  
@@ -13326,8 +13372,8 @@ index 70cea9e24d..b998d02b5a 100644
  static void end_swap_bio_write(struct bio *bio)
  {
  	__end_swap_bio_write(bio);
-@@ -233,6 +280,173 @@ static void swap_zeromap_folio_clear(struct folio *folio)
- 	}
+@@ -244,6 +291,173 @@ static void swap_zeromap_folio_clear(struct folio *folio)
+ 	swap_cluster_unlock(ci);
  }
  
 +/*
@@ -13341,7 +13387,7 @@ index 70cea9e24d..b998d02b5a 100644
 +static inline void do_swapout(struct folio *folio, struct swap_iocb **swap_plug)
 +{
 +	if (zswap_store(folio)) {
-+		count_mthp_stat(folio_order(folio), MTHP_STAT_SWPOUT);
++		count_mthp_stat(folio_order(folio), MTHP_STAT_ZSWPOUT);
 +		folio_unlock(folio);
 +	} else
 +		__swap_writepage(folio, swap_plug); /* Implies folio_unlock(folio) */
@@ -13500,7 +13546,7 @@ index 70cea9e24d..b998d02b5a 100644
  /*
   * We may have stale swap cache pages in memory: notice
   * them here and get rid of the unnecessary final write.
-@@ -272,6 +486,14 @@ int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug)
+@@ -282,6 +496,14 @@ int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug)
  	 */
  	swap_zeromap_folio_clear(folio);
  
@@ -13515,7 +13561,7 @@ index 70cea9e24d..b998d02b5a 100644
  	if (zswap_store(folio)) {
  		count_mthp_stat(folio_order(folio), MTHP_STAT_ZSWPOUT);
  		goto out_unlock;
-@@ -292,6 +514,72 @@ int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug)
+@@ -302,6 +524,72 @@ int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug)
  	return ret;
  }
  
@@ -13588,7 +13634,7 @@ index 70cea9e24d..b998d02b5a 100644
  static inline void count_swpout_vm_event(struct folio *folio)
  {
  #ifdef CONFIG_TRANSPARENT_HUGEPAGE
-@@ -431,6 +719,49 @@ static void swap_writepage_bdev_sync(struct folio *folio,
+@@ -446,6 +734,49 @@ static void swap_writepage_bdev_sync(struct folio *folio,
  	__end_swap_bio_write(&bio);
  }
  
@@ -13639,10 +13685,10 @@ index 70cea9e24d..b998d02b5a 100644
  		struct swap_info_struct *sis)
  {
 diff --git a/mm/page_isolation.c b/mm/page_isolation.c
-index c48ff5c002..12904c811f 100644
+index 32ce8a7d9d..b23c09b467 100644
 --- a/mm/page_isolation.c
 +++ b/mm/page_isolation.c
-@@ -73,8 +73,25 @@ bool page_is_unmovable(struct zone *zone, struct page *page,
+@@ -80,8 +80,25 @@ bool page_is_unmovable(struct zone *zone, struct page *page,
  	 * because their page->_refcount is zero at all time.
  	 */
  	if (!page_ref_count(page)) {
@@ -13670,7 +13716,7 @@ index c48ff5c002..12904c811f 100644
  		return false;
  	}
  
-@@ -123,8 +140,16 @@ bool page_is_unmovable(struct zone *zone, struct page *page,
+@@ -130,8 +147,16 @@ bool page_is_unmovable(struct zone *zone, struct page *page,
   * dereference that page (e.g., dumping), it has to make sure that it
   * cannot get removed (e.g., via memory unplug) concurrently.
   *
@@ -13689,7 +13735,7 @@ index c48ff5c002..12904c811f 100644
  {
  	struct page *page = pfn_to_page(start_pfn);
 diff --git a/mm/rmap.c b/mm/rmap.c
-index 78b7fb5f36..0cfaf5bcce 100644
+index 1c77d5dc06..898b893c09 100644
 --- a/mm/rmap.c
 +++ b/mm/rmap.c
 @@ -75,6 +75,7 @@
@@ -13713,7 +13759,7 @@ index 78b7fb5f36..0cfaf5bcce 100644
  			if (clear_flush_young_ptes_notify(vma, address, pvmw.pte, nr))
  				referenced++;
 diff --git a/mm/swap.c b/mm/swap.c
-index 5cc44f0de9..d7f481167b 100644
+index 588f50d8f1..2b953fec8d 100644
 --- a/mm/swap.c
 +++ b/mm/swap.c
 @@ -37,6 +37,7 @@
@@ -13768,7 +13814,7 @@ index 5cc44f0de9..d7f481167b 100644
  }
  
  /*
-@@ -171,6 +200,27 @@ static void folio_batch_move_lru(struct folio_batch *fbatch, move_fn_t move_fn)
+@@ -199,6 +228,27 @@ static void folio_batch_move_lru(struct folio_batch *fbatch, move_fn_t move_fn)
  		folio_lruvec_relock_irqsave(folio, &lruvec, &flags);
  		move_fn(lruvec, folio);
  
@@ -13796,7 +13842,7 @@ index 5cc44f0de9..d7f481167b 100644
  		folio_set_lru(folio);
  	}
  
-@@ -215,6 +265,44 @@ static void lru_move_tail(struct lruvec *lruvec, struct folio *folio)
+@@ -250,6 +300,44 @@ static void lru_move_tail(struct lruvec *lruvec, struct folio *folio)
  	if (folio_test_unevictable(folio))
  		return;
  
@@ -13841,7 +13887,7 @@ index 5cc44f0de9..d7f481167b 100644
  	lruvec_del_folio(lruvec, folio);
  	folio_clear_active(folio);
  	lruvec_add_folio_tail(lruvec, folio);
-@@ -234,6 +322,14 @@ void folio_rotate_reclaimable(struct folio *folio)
+@@ -269,6 +357,14 @@ void folio_rotate_reclaimable(struct folio *folio)
  	    folio_test_unevictable(folio) || !folio_test_lru(folio))
  		return;
  
@@ -13856,7 +13902,7 @@ index 5cc44f0de9..d7f481167b 100644
  	folio_batch_add_and_move(folio, lru_move_tail);
  }
  
-@@ -304,6 +400,12 @@ void lru_note_cost_refault(struct folio *folio)
+@@ -339,6 +435,12 @@ void lru_note_cost_refault(struct folio *folio)
  				folio_nr_pages(folio), 0);
  }
  
@@ -13869,7 +13915,7 @@ index 5cc44f0de9..d7f481167b 100644
  static void lru_activate(struct lruvec *lruvec, struct folio *folio)
  {
  	long nr_pages = folio_nr_pages(folio);
-@@ -311,10 +413,24 @@ static void lru_activate(struct lruvec *lruvec, struct folio *folio)
+@@ -346,10 +448,24 @@ static void lru_activate(struct lruvec *lruvec, struct folio *folio)
  	if (folio_test_active(folio) || folio_test_unevictable(folio))
  		return;
  
@@ -13895,7 +13941,7 @@ index 5cc44f0de9..d7f481167b 100644
  	trace_mm_lru_activate(folio);
  
  	__count_vm_events(PGACTIVATE, nr_pages);
-@@ -336,6 +452,13 @@ void folio_activate(struct folio *folio)
+@@ -371,6 +487,13 @@ void folio_activate(struct folio *folio)
  	    !folio_test_lru(folio))
  		return;
  
@@ -13909,7 +13955,7 @@ index 5cc44f0de9..d7f481167b 100644
  	folio_batch_add_and_move(folio, lru_activate);
  }
  
-@@ -351,6 +474,15 @@ void folio_activate(struct folio *folio)
+@@ -386,6 +509,15 @@ void folio_activate(struct folio *folio)
  	if (!folio_test_clear_lru(folio))
  		return;
  
@@ -13925,7 +13971,7 @@ index 5cc44f0de9..d7f481167b 100644
  	lruvec = folio_lruvec_lock_irq(folio);
  	lru_activate(lruvec, folio);
  	lruvec_unlock_irq(lruvec);
-@@ -466,6 +598,46 @@ void folio_mark_accessed(struct folio *folio)
+@@ -501,6 +633,46 @@ void folio_mark_accessed(struct folio *folio)
  		lru_gen_inc_refs(folio);
  		return;
  	}
@@ -13972,10 +14018,11 @@ index 5cc44f0de9..d7f481167b 100644
  
  	if (!folio_test_referenced(folio)) {
  		folio_set_referenced(folio);
-@@ -510,9 +682,24 @@ void folio_add_lru(struct folio *folio)
+@@ -544,6 +716,30 @@ void folio_add_lru(struct folio *folio)
+ 			folio_test_unevictable(folio), folio);
  	VM_BUG_ON_FOLIO(folio_test_lru(folio), folio);
  
- 	/* see the comment in lru_gen_folio_seq() */
++	/* see the comment in lru_gen_folio_seq() */
 +#ifdef CONFIG_LRU_MARIE
 +	/*
 +	 * Marie bypass: Marie tracks folios via per-PFN state bytes,
@@ -13985,19 +14032,32 @@ index 5cc44f0de9..d7f481167b 100644
 +	 * VM_BUG_ON_FOLIO(folio_test_active(folio), folio) in
 +	 * mm/vmscan.c. Skip the MGLRU fault hint when Marie owns
 +	 * the LRU. (See also defensive clear in lru_marie_add_folio.)
++	 *
++	 * Otherwise apply the 7.2 fault hint: refaulted workingset
++	 * folios get PG_active; not-yet-referenced (prefaulted file)
++	 * folios get folio_mark_accessed() -> PG_referenced so
++	 * lru_gen_folio_seq() places them into the second oldest gen.
 +	 */
 +	if (!lru_marie_enabled() && lru_gen_enabled() && !folio_test_unevictable(folio) &&
-+	    lru_gen_in_fault() && !(current->flags & PF_MEMALLOC))
-+		folio_set_active(folio);
++	    lru_gen_in_fault() && !(current->flags & PF_MEMALLOC)) {
++		if (folio_test_workingset(folio))
++			folio_set_active(folio);
++		else if (!folio_test_referenced(folio))
++			folio_mark_accessed(folio);
++	}
 +#else
- 	if (lru_gen_enabled() && !folio_test_unevictable(folio) &&
- 	    lru_gen_in_fault() && !(current->flags & PF_MEMALLOC))
- 		folio_set_active(folio);
+ 	/*
+ 	 * For refaulted workingset folios, set PG_active so they
+ 	 * can be added to active generations.
+@@ -558,6 +754,7 @@ void folio_add_lru(struct folio *folio)
+ 		else if (!folio_test_referenced(folio))
+ 			folio_mark_accessed(folio);
+ 	}
 +#endif
  
  	folio_batch_add_and_move(folio, lru_add);
  }
-@@ -569,6 +756,11 @@ static void lru_deactivate_file(struct lruvec *lruvec, struct folio *folio)
+@@ -614,6 +811,11 @@ static void lru_deactivate_file(struct lruvec *lruvec, struct folio *folio)
  	if (folio_mapped(folio))
  		return;
  
@@ -14009,7 +14069,7 @@ index 5cc44f0de9..d7f481167b 100644
  	lruvec_del_folio(lruvec, folio);
  	folio_clear_active(folio);
  	folio_clear_referenced(folio);
-@@ -580,14 +772,24 @@ static void lru_deactivate_file(struct lruvec *lruvec, struct folio *folio)
+@@ -625,14 +827,24 @@ static void lru_deactivate_file(struct lruvec *lruvec, struct folio *folio)
  		 * race window is _really_ small and  it's not a critical
  		 * problem.
  		 */
@@ -14036,7 +14096,7 @@ index 5cc44f0de9..d7f481167b 100644
  		__count_vm_events(PGROTATED, nr_pages);
  	}
  
-@@ -605,10 +807,20 @@ static void lru_deactivate(struct lruvec *lruvec, struct folio *folio)
+@@ -650,10 +862,20 @@ static void lru_deactivate(struct lruvec *lruvec, struct folio *folio)
  	if (folio_test_unevictable(folio) || !(folio_test_active(folio) || lru_gen_enabled()))
  		return;
  
@@ -14058,7 +14118,7 @@ index 5cc44f0de9..d7f481167b 100644
  
  	__count_vm_events(PGDEACTIVATE, nr_pages);
  	count_memcg_events(lruvec_memcg(lruvec), PGDEACTIVATE, nr_pages);
-@@ -622,6 +834,11 @@ static void lru_lazyfree(struct lruvec *lruvec, struct folio *folio)
+@@ -667,6 +889,11 @@ static void lru_lazyfree(struct lruvec *lruvec, struct folio *folio)
  	    folio_test_swapcache(folio) || folio_test_unevictable(folio))
  		return;
  
@@ -14070,7 +14130,7 @@ index 5cc44f0de9..d7f481167b 100644
  	lruvec_del_folio(lruvec, folio);
  	folio_clear_active(folio);
  	if (lru_gen_enabled())
-@@ -634,7 +851,12 @@ static void lru_lazyfree(struct lruvec *lruvec, struct folio *folio)
+@@ -679,7 +906,12 @@ static void lru_lazyfree(struct lruvec *lruvec, struct folio *folio)
  	 * anonymous folios
  	 */
  	folio_clear_swapbacked(folio);
@@ -14084,7 +14144,7 @@ index 5cc44f0de9..d7f481167b 100644
  
  	__count_vm_events(PGLAZYFREE, nr_pages);
  	count_memcg_events(lruvec_memcg(lruvec), PGLAZYFREE, nr_pages);
-@@ -698,6 +920,13 @@ void deactivate_file_folio(struct folio *folio)
+@@ -743,6 +975,13 @@ void deactivate_file_folio(struct folio *folio)
  	if (lru_gen_enabled() && lru_gen_clear_refs(folio))
  		return;
  
@@ -14098,7 +14158,7 @@ index 5cc44f0de9..d7f481167b 100644
  	folio_batch_add_and_move(folio, lru_deactivate_file);
  }
  
-@@ -717,6 +946,13 @@ void folio_deactivate(struct folio *folio)
+@@ -762,6 +1001,13 @@ void folio_deactivate(struct folio *folio)
  	if (lru_gen_enabled() ? lru_gen_clear_refs(folio) : !folio_test_active(folio))
  		return;
  
@@ -14112,7 +14172,7 @@ index 5cc44f0de9..d7f481167b 100644
  	folio_batch_add_and_move(folio, lru_deactivate);
  }
  
-@@ -734,6 +970,14 @@ void folio_mark_lazyfree(struct folio *folio)
+@@ -779,6 +1025,14 @@ void folio_mark_lazyfree(struct folio *folio)
  	    folio_test_swapcache(folio) || folio_test_unevictable(folio))
  		return;
  
@@ -14128,10 +14188,10 @@ index 5cc44f0de9..d7f481167b 100644
  }
  
 diff --git a/mm/swap.h b/mm/swap.h
-index a77016f242..fc816e14de 100644
+index 77d2d14eda..4b915f45e1 100644
 --- a/mm/swap.h
 +++ b/mm/swap.h
-@@ -227,6 +227,10 @@ static inline void swap_read_unplug(struct swap_iocb *plug)
+@@ -251,6 +251,10 @@ static inline void swap_read_unplug(struct swap_iocb *plug)
  void swap_write_unplug(struct swap_iocb *sio);
  int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug);
  void __swap_writepage(struct folio *folio, struct swap_iocb **swap_plug);
@@ -14143,7 +14203,7 @@ index a77016f242..fc816e14de 100644
  /* linux/mm/swap_state.c */
  extern struct address_space swap_space __read_mostly;
 diff --git a/mm/vmscan.c b/mm/vmscan.c
-index bd1b1aa125..00c5fd8801 100644
+index 35c3bb15ae..20a653848f 100644
 --- a/mm/vmscan.c
 +++ b/mm/vmscan.c
 @@ -39,6 +39,7 @@
@@ -14154,7 +14214,7 @@ index bd1b1aa125..00c5fd8801 100644
  #include <linux/migrate.h>
  #include <linux/delayacct.h>
  #include <linux/sysctl.h>
-@@ -181,6 +182,55 @@ struct scan_control {
+@@ -179,6 +180,55 @@ struct scan_control {
  	struct reclaim_state reclaim_state;
  };
  
@@ -14210,7 +14270,7 @@ index bd1b1aa125..00c5fd8801 100644
  #ifdef ARCH_HAS_PREFETCHW
  #define prefetchw_prev_lru_folio(_folio, _base, _field)			\
  	do {								\
-@@ -366,6 +416,74 @@ static inline bool can_reclaim_anon_pages(struct mem_cgroup *memcg,
+@@ -364,6 +414,74 @@ static inline bool can_reclaim_anon_pages(struct mem_cgroup *memcg,
  	return can_demote(nid, sc, memcg);
  }
  
@@ -14285,7 +14345,7 @@ index bd1b1aa125..00c5fd8801 100644
  /*
   * This misses isolated folios which are not accounted for to save counters.
   * As the data only determines if reclaim or compaction continues, it is
-@@ -378,8 +496,9 @@ unsigned long zone_reclaimable_pages(struct zone *zone)
+@@ -376,8 +494,9 @@ unsigned long zone_reclaimable_pages(struct zone *zone)
  	nr = zone_page_state_snapshot(zone, NR_ZONE_INACTIVE_FILE) +
  		zone_page_state_snapshot(zone, NR_ZONE_ACTIVE_FILE);
  	if (can_reclaim_anon_pages(NULL, zone_to_nid(zone), NULL))
@@ -14297,7 +14357,7 @@ index bd1b1aa125..00c5fd8801 100644
  
  	return nr;
  }
-@@ -458,6 +577,44 @@ static int reclaimer_offset(struct scan_control *sc)
+@@ -456,6 +575,44 @@ static int reclaimer_offset(struct scan_control *sc)
  	return PGSTEAL_DIRECT - PGSTEAL_KSWAPD;
  }
  
@@ -14342,7 +14402,7 @@ index bd1b1aa125..00c5fd8801 100644
  /*
   * We detected a synchronous write error writing a folio out.  Probably
   * -ENOSPC.  We need to propagate that into the address_space for a subsequent
-@@ -877,10 +1034,7 @@ static enum folio_references folio_check_references(struct folio *folio,
+@@ -874,10 +1031,7 @@ static enum folio_references folio_check_references(struct folio *folio,
  		return FOLIOREF_ACTIVATE;
  
  	/*
@@ -14354,7 +14414,7 @@ index bd1b1aa125..00c5fd8801 100644
  	 */
  	if (referenced_ptes == -1)
  		return FOLIOREF_KEEP;
-@@ -894,6 +1048,36 @@ static enum folio_references folio_check_references(struct folio *folio,
+@@ -891,6 +1045,36 @@ static enum folio_references folio_check_references(struct folio *folio,
  
  	referenced_folio = folio_test_clear_referenced(folio);
  
@@ -14391,7 +14451,7 @@ index bd1b1aa125..00c5fd8801 100644
  	if (referenced_ptes) {
  		/*
  		 * All mapped folios start out with page table
-@@ -1053,9 +1237,13 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
+@@ -1050,9 +1234,13 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
  }
  
  /*
@@ -14407,7 +14467,7 @@ index bd1b1aa125..00c5fd8801 100644
  		struct pglist_data *pgdat, struct scan_control *sc,
  		struct reclaim_stat *stat, bool ignore_references,
  		struct mem_cgroup *memcg)
-@@ -1916,7 +2104,29 @@ static unsigned int move_folios_to_lru(struct list_head *list)
+@@ -1913,7 +2101,29 @@ static unsigned int move_folios_to_lru(struct list_head *list)
  			continue;
  		}
  
@@ -14438,7 +14498,7 @@ index bd1b1aa125..00c5fd8801 100644
  		nr_pages = folio_nr_pages(folio);
  		nr_moved += nr_pages;
  		if (folio_test_active(folio))
-@@ -5307,6 +5517,55 @@ static bool drain_evictable(struct lruvec *lruvec)
+@@ -5262,6 +5472,55 @@ static bool drain_evictable(struct lruvec *lruvec)
  	return true;
  }
  
@@ -14494,7 +14554,7 @@ index bd1b1aa125..00c5fd8801 100644
  static void lru_gen_change_state(bool enabled)
  {
  	static DEFINE_MUTEX(state_mutex);
-@@ -5827,7 +6086,15 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
+@@ -5783,7 +6042,15 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
  	struct lru_gen_mm_state *mm_state = get_mm_state(lruvec);
  
  	lrugen->max_seq = MIN_NR_GENS + 1;
@@ -14511,7 +14571,7 @@ index bd1b1aa125..00c5fd8801 100644
  
  	for (i = 0; i <= MIN_NR_GENS + 1; i++)
  		lrugen->timestamps[i] = jiffies;
-@@ -5927,7 +6194,23 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+@@ -5883,7 +6150,23 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
  	unsigned long nr_to_reclaim = sc->nr_to_reclaim;
  	bool proportional_reclaim;
  	struct blk_plug plug;
@@ -14535,7 +14595,7 @@ index bd1b1aa125..00c5fd8801 100644
  	if ((lru_gen_enabled() || lru_gen_switching()) && !root_reclaim(sc)) {
  		lru_gen_shrink_lruvec(lruvec, sc);
  
-@@ -5938,6 +6221,29 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+@@ -5894,6 +6177,29 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
  
  	get_scan_count(lruvec, sc, nr);
  
@@ -14565,7 +14625,7 @@ index bd1b1aa125..00c5fd8801 100644
  	/* Record the original scan target for proportional adjustments later */
  	memcpy(targets, nr, sizeof(nr));
  
-@@ -6193,14 +6499,32 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+@@ -6149,14 +6455,32 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
  	struct lruvec *target_lruvec;
  	bool reclaimable = false;
  
@@ -14599,7 +14659,7 @@ index bd1b1aa125..00c5fd8801 100644
  
  	target_lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup, pgdat);
  
-@@ -6469,6 +6793,17 @@ static void snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat)
+@@ -6425,6 +6749,17 @@ static void snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat)
  	struct lruvec *target_lruvec;
  	unsigned long refaults;
  
@@ -14617,7 +14677,7 @@ index bd1b1aa125..00c5fd8801 100644
  	if (lru_gen_enabled() && !lru_gen_switching())
  		return;
  
-@@ -6859,6 +7194,21 @@ static void kswapd_age_node(struct pglist_data *pgdat, struct scan_control *sc)
+@@ -6815,6 +7150,21 @@ static void kswapd_age_node(struct pglist_data *pgdat, struct scan_control *sc)
  	struct mem_cgroup *memcg;
  	struct lruvec *lruvec;
  
@@ -14639,7 +14699,7 @@ index bd1b1aa125..00c5fd8801 100644
  	if (lru_gen_enabled() || lru_gen_switching()) {
  		lru_gen_age_node(pgdat, sc);
  
-@@ -6977,6 +7327,55 @@ static bool pgdat_balanced(pg_data_t *pgdat, int order, int highest_zoneidx)
+@@ -6933,6 +7283,55 @@ static bool pgdat_balanced(pg_data_t *pgdat, int order, int highest_zoneidx)
  	return false;
  }
  
@@ -14695,7 +14755,7 @@ index bd1b1aa125..00c5fd8801 100644
  /* Clear pgdat state for congested, dirty or under writeback. */
  static void clear_pgdat_congested(pg_data_t *pgdat)
  {
-@@ -7180,6 +7579,34 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
+@@ -7138,6 +7537,34 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
  		 * re-evaluate if boosting is required when kswapd next wakes.
  		 */
  		balanced = pgdat_balanced(pgdat, sc.order, highest_zoneidx);
@@ -14730,7 +14790,7 @@ index bd1b1aa125..00c5fd8801 100644
  		if (!balanced && nr_boost_reclaim) {
  			nr_boost_reclaim = 0;
  			goto restart;
-@@ -7632,6 +8059,9 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
+@@ -7593,6 +8020,9 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
  void __meminit kswapd_run(int nid)
  {
  	pg_data_t *pgdat = NODE_DATA(nid);
@@ -14740,7 +14800,7 @@ index bd1b1aa125..00c5fd8801 100644
  
  	pgdat_kswapd_lock(pgdat);
  	if (!pgdat->kswapd) {
-@@ -7645,7 +8075,32 @@ void __meminit kswapd_run(int nid)
+@@ -7606,7 +8036,32 @@ void __meminit kswapd_run(int nid)
  		} else {
  			wake_up_process(pgdat->kswapd);
  		}
@@ -14773,7 +14833,7 @@ index bd1b1aa125..00c5fd8801 100644
  	pgdat_kswapd_unlock(pgdat);
  }
  
-@@ -7664,16 +8119,52 @@ void __meminit kswapd_stop(int nid)
+@@ -7625,16 +8080,52 @@ void __meminit kswapd_stop(int nid)
  		kthread_stop(kswapd);
  		pgdat->kswapd = NULL;
  	}
