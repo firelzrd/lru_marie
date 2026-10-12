@@ -1,7 +1,7 @@
-From 422514b3531d243c6d57b574b8daef948244016a Mon Sep 17 00:00:00 2001
+From 892ddb49b119578e2feefe7682b9017447d66556 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sat, 10 Oct 2026 19:41:01 +0900
-Subject: [PATCH] linux7.3-rc1-lru_marie-0.12.0
+Date: Mon, 12 Oct 2026 20:30:35 +0900
+Subject: [PATCH] linux7.3-rc1-lru_marie-0.12.0r2
 
 ---
  include/linux/lru_marie.h      |  534 +++++++++
@@ -9,6 +9,7 @@ Subject: [PATCH] linux7.3-rc1-lru_marie-0.12.0
  include/linux/mm_inline.h      |  103 +-
  include/linux/mmzone.h         |   15 +
  include/linux/swap_ops.h       |   12 +
+ localversion                   |    1 -
  mm/Kconfig                     |   72 ++
  mm/Makefile                    |    1 +
  mm/compaction.c                |   32 +-
@@ -50,9 +51,9 @@ Subject: [PATCH] linux7.3-rc1-lru_marie-0.12.0
  mm/rmap.c                      |    6 +
  mm/swap.h                      |    4 +
  mm/vmscan.c                    |  593 ++++++++-
- scripts/setlocalversion        |    2 +-
- 47 files changed, 13894 insertions(+), 44 deletions(-)
+ 47 files changed, 13893 insertions(+), 44 deletions(-)
  create mode 100644 include/linux/lru_marie.h
+ delete mode 100644 localversion
  create mode 100644 mm/lru_marie/Makefile
  create mode 100644 mm/lru_marie/account.h
  create mode 100644 mm/lru_marie/bitmap.c
@@ -911,6 +912,14 @@ index 57ac6c703f..fb237b4c05 100644
  };
  
  /*
+diff --git a/localversion b/localversion
+deleted file mode 100644
+index 456553120f..0000000000
+--- a/localversion
++++ /dev/null
+@@ -1 +0,0 @@
+--marie
+\ No newline at end of file
 diff --git a/mm/Kconfig b/mm/Kconfig
 index 604c58199a..85389c72df 100644
 --- a/mm/Kconfig
@@ -14997,19 +15006,6 @@ index f11491ee9e..5b2cbf9bb1 100644
  		.extra1		= SYSCTL_ZERO,
  		.extra2		= SYSCTL_TWO_HUNDRED,
  	},
-diff --git a/scripts/setlocalversion b/scripts/setlocalversion
-index 28169d7e14..5cb02894ac 100755
---- a/scripts/setlocalversion
-+++ b/scripts/setlocalversion
-@@ -117,7 +117,7 @@ scm_version()
- 		# If only the short version is requested, don't bother
- 		# running further git commands
- 		if $short; then
--			echo "+"
-+			#echo "+"
- 			return
- 		fi
- 
 -- 
 2.34.1
 
