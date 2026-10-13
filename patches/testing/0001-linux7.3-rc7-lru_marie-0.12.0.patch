@@ -1,7 +1,7 @@
-From 892ddb49b119578e2feefe7682b9017447d66556 Mon Sep 17 00:00:00 2001
+From 1bd83e6d9be824133ece529a346eed6ba7ffe98f Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
 Date: Mon, 12 Oct 2026 20:30:35 +0900
-Subject: [PATCH] linux7.3-rc1-lru_marie-0.12.0r2
+Subject: [PATCH] linux7.3-rc7-lru_marie-0.12.0
 
 ---
  include/linux/lru_marie.h      |  534 +++++++++
@@ -9,7 +9,6 @@ Subject: [PATCH] linux7.3-rc1-lru_marie-0.12.0r2
  include/linux/mm_inline.h      |  103 +-
  include/linux/mmzone.h         |   15 +
  include/linux/swap_ops.h       |   12 +
- localversion                   |    1 -
  mm/Kconfig                     |   72 ++
  mm/Makefile                    |    1 +
  mm/compaction.c                |   32 +-
@@ -51,9 +50,8 @@ Subject: [PATCH] linux7.3-rc1-lru_marie-0.12.0r2
  mm/rmap.c                      |    6 +
  mm/swap.h                      |    4 +
  mm/vmscan.c                    |  593 ++++++++-
- 47 files changed, 13893 insertions(+), 44 deletions(-)
+ 46 files changed, 13893 insertions(+), 43 deletions(-)
  create mode 100644 include/linux/lru_marie.h
- delete mode 100644 localversion
  create mode 100644 mm/lru_marie/Makefile
  create mode 100644 mm/lru_marie/account.h
  create mode 100644 mm/lru_marie/bitmap.c
@@ -912,14 +910,6 @@ index 57ac6c703f..fb237b4c05 100644
  };
  
  /*
-diff --git a/localversion b/localversion
-deleted file mode 100644
-index 456553120f..0000000000
---- a/localversion
-+++ /dev/null
-@@ -1 +0,0 @@
---marie
-\ No newline at end of file
 diff --git a/mm/Kconfig b/mm/Kconfig
 index 604c58199a..85389c72df 100644
 --- a/mm/Kconfig
@@ -1073,18 +1063,18 @@ index a049415512..305bf34bfd 100644
  			/*
  			 * Defer proactive compaction if the fragmentation
 diff --git a/mm/folio.c b/mm/folio.c
-index c02dcea9c0..86cfdfd341 100644
+index 50a6dbe559..f5558b1c74 100644
 --- a/mm/folio.c
 +++ b/mm/folio.c
-@@ -33,6 +33,7 @@
- #include <linux/page_idle.h>
+@@ -34,6 +34,7 @@
  #include <linux/local_lock.h>
  #include <linux/buffer_head.h>
+ #include <linux/kvm_types.h>
 +#include <linux/lru_marie.h>
  
  #include "internal.h"
  #include "page_alloc.h"
-@@ -66,11 +67,39 @@ static DEFINE_PER_CPU(struct cpu_fbatches, cpu_fbatches) = {
+@@ -67,11 +68,39 @@ static DEFINE_PER_CPU(struct cpu_fbatches, cpu_fbatches) = {
  static void __page_cache_release(struct folio *folio, struct lruvec **lruvecp,
  		unsigned long *flagsp)
  {
@@ -1128,7 +1118,7 @@ index c02dcea9c0..86cfdfd341 100644
  }
  
  /*
-@@ -192,6 +221,27 @@ static void folio_batch_move_lru(struct folio_batch *fbatch, move_fn_t move_fn)
+@@ -193,6 +222,27 @@ static void folio_batch_move_lru(struct folio_batch *fbatch, move_fn_t move_fn)
  		folio_lruvec_relock_irqsave(folio, &lruvec, &flags);
  		move_fn(lruvec, folio);
  
@@ -1156,7 +1146,7 @@ index c02dcea9c0..86cfdfd341 100644
  		folio_set_lru(folio);
  	}
  
-@@ -243,6 +293,44 @@ static void lru_move_tail(struct lruvec *lruvec, struct folio *folio)
+@@ -244,6 +294,44 @@ static void lru_move_tail(struct lruvec *lruvec, struct folio *folio)
  	if (folio_test_unevictable(folio))
  		return;
  
@@ -1201,7 +1191,7 @@ index c02dcea9c0..86cfdfd341 100644
  	lruvec_del_folio(lruvec, folio);
  	folio_clear_active(folio);
  	lruvec_add_folio_tail(lruvec, folio);
-@@ -262,9 +350,23 @@ void folio_rotate_reclaimable(struct folio *folio)
+@@ -263,9 +351,23 @@ void folio_rotate_reclaimable(struct folio *folio)
  	    folio_test_unevictable(folio) || !folio_test_lru(folio))
  		return;
  
@@ -1225,7 +1215,7 @@ index c02dcea9c0..86cfdfd341 100644
  static void lru_activate(struct lruvec *lruvec, struct folio *folio)
  {
  	long nr_pages = folio_nr_pages(folio);
-@@ -272,10 +374,24 @@ static void lru_activate(struct lruvec *lruvec, struct folio *folio)
+@@ -273,10 +375,24 @@ static void lru_activate(struct lruvec *lruvec, struct folio *folio)
  	if (folio_test_active(folio) || folio_test_unevictable(folio))
  		return;
  
@@ -1251,7 +1241,7 @@ index c02dcea9c0..86cfdfd341 100644
  	trace_mm_lru_activate(folio);
  
  	__count_vm_events(PGACTIVATE, nr_pages);
-@@ -297,6 +413,13 @@ void folio_activate(struct folio *folio)
+@@ -298,6 +414,13 @@ void folio_activate(struct folio *folio)
  	    !folio_test_lru(folio))
  		return;
  
@@ -1265,7 +1255,7 @@ index c02dcea9c0..86cfdfd341 100644
  	folio_batch_add_and_move(folio, lru_activate);
  }
  
-@@ -312,6 +435,15 @@ void folio_activate(struct folio *folio)
+@@ -313,6 +436,15 @@ void folio_activate(struct folio *folio)
  	if (!folio_test_clear_lru(folio))
  		return;
  
@@ -1281,7 +1271,7 @@ index c02dcea9c0..86cfdfd341 100644
  	lruvec = folio_lruvec_lock_irq(folio);
  	lru_activate(lruvec, folio);
  	lruvec_unlock_irq(lruvec);
-@@ -427,6 +559,46 @@ void folio_mark_accessed(struct folio *folio)
+@@ -428,6 +560,46 @@ void folio_mark_accessed(struct folio *folio)
  		lru_gen_inc_refs(folio);
  		return;
  	}
@@ -1328,7 +1318,7 @@ index c02dcea9c0..86cfdfd341 100644
  
  	if (!folio_test_referenced(folio)) {
  		folio_set_referenced(folio);
-@@ -470,6 +642,30 @@ void folio_add_lru(struct folio *folio)
+@@ -471,6 +643,30 @@ void folio_add_lru(struct folio *folio)
  			folio_test_unevictable(folio), folio);
  	VM_BUG_ON_FOLIO(folio_test_lru(folio), folio);
  
@@ -1359,7 +1349,7 @@ index c02dcea9c0..86cfdfd341 100644
  	/*
  	 * For refaulted workingset folios, set PG_active so they
  	 * can be added to active generations.
-@@ -484,6 +680,7 @@ void folio_add_lru(struct folio *folio)
+@@ -485,6 +681,7 @@ void folio_add_lru(struct folio *folio)
  		else if (!folio_test_referenced(folio))
  			folio_mark_accessed(folio);
  	}
@@ -1367,7 +1357,7 @@ index c02dcea9c0..86cfdfd341 100644
  
  	folio_batch_add_and_move(folio, lru_add);
  }
-@@ -540,6 +737,11 @@ static void lru_deactivate_file(struct lruvec *lruvec, struct folio *folio)
+@@ -541,6 +738,11 @@ static void lru_deactivate_file(struct lruvec *lruvec, struct folio *folio)
  	if (folio_mapped(folio))
  		return;
  
@@ -1379,7 +1369,7 @@ index c02dcea9c0..86cfdfd341 100644
  	lruvec_del_folio(lruvec, folio);
  	folio_clear_active(folio);
  	folio_clear_referenced(folio);
-@@ -551,14 +753,24 @@ static void lru_deactivate_file(struct lruvec *lruvec, struct folio *folio)
+@@ -552,14 +754,24 @@ static void lru_deactivate_file(struct lruvec *lruvec, struct folio *folio)
  		 * race window is _really_ small and  it's not a critical
  		 * problem.
  		 */
@@ -1406,7 +1396,7 @@ index c02dcea9c0..86cfdfd341 100644
  		__count_vm_events(PGROTATED, nr_pages);
  	}
  
-@@ -576,10 +788,20 @@ static void lru_deactivate(struct lruvec *lruvec, struct folio *folio)
+@@ -577,10 +789,20 @@ static void lru_deactivate(struct lruvec *lruvec, struct folio *folio)
  	if (folio_test_unevictable(folio) || !(folio_test_active(folio) || lru_gen_enabled()))
  		return;
  
@@ -1428,7 +1418,7 @@ index c02dcea9c0..86cfdfd341 100644
  
  	__count_vm_events(PGDEACTIVATE, nr_pages);
  	count_memcg_events(lruvec_memcg(lruvec), PGDEACTIVATE, nr_pages);
-@@ -593,6 +815,11 @@ static void lru_lazyfree(struct lruvec *lruvec, struct folio *folio)
+@@ -594,6 +816,11 @@ static void lru_lazyfree(struct lruvec *lruvec, struct folio *folio)
  	    folio_test_swapcache(folio) || folio_test_unevictable(folio))
  		return;
  
@@ -1440,7 +1430,7 @@ index c02dcea9c0..86cfdfd341 100644
  	lruvec_del_folio(lruvec, folio);
  	folio_clear_active(folio);
  	if (lru_gen_enabled())
-@@ -605,7 +832,12 @@ static void lru_lazyfree(struct lruvec *lruvec, struct folio *folio)
+@@ -606,7 +833,12 @@ static void lru_lazyfree(struct lruvec *lruvec, struct folio *folio)
  	 * anonymous folios
  	 */
  	folio_clear_swapbacked(folio);
@@ -1454,7 +1444,7 @@ index c02dcea9c0..86cfdfd341 100644
  
  	__count_vm_events(PGLAZYFREE, nr_pages);
  	count_memcg_events(lruvec_memcg(lruvec), PGLAZYFREE, nr_pages);
-@@ -672,6 +904,13 @@ void deactivate_file_folio(struct folio *folio)
+@@ -673,6 +905,13 @@ void deactivate_file_folio(struct folio *folio)
  	if (lru_gen_enabled() && lru_gen_clear_refs(folio))
  		return;
  
@@ -1468,7 +1458,7 @@ index c02dcea9c0..86cfdfd341 100644
  	folio_batch_add_and_move(folio, lru_deactivate_file);
  }
  
-@@ -691,6 +930,13 @@ void folio_deactivate(struct folio *folio)
+@@ -692,6 +931,13 @@ void folio_deactivate(struct folio *folio)
  	if (lru_gen_enabled() ? lru_gen_clear_refs(folio) : !folio_test_active(folio))
  		return;
  
@@ -1482,7 +1472,7 @@ index c02dcea9c0..86cfdfd341 100644
  	folio_batch_add_and_move(folio, lru_deactivate);
  }
  
-@@ -708,6 +954,14 @@ void folio_mark_lazyfree(struct folio *folio)
+@@ -709,6 +955,14 @@ void folio_mark_lazyfree(struct folio *folio)
  	    folio_test_swapcache(folio) || folio_test_unevictable(folio))
  		return;
  
@@ -1497,7 +1487,7 @@ index c02dcea9c0..86cfdfd341 100644
  	folio_batch_add_and_move(folio, lru_lazyfree);
  }
  
-@@ -1123,12 +1377,25 @@ static void lruvec_reparent_lru(struct lruvec *child_lruvec,
+@@ -1125,12 +1379,25 @@ static void lruvec_reparent_lru(struct lruvec *child_lruvec,
  {
  	int zid;
  	struct zone *zone;
@@ -1525,7 +1515,7 @@ index c02dcea9c0..86cfdfd341 100644
  		if (!size)
  			continue;
 diff --git a/mm/huge_memory.c b/mm/huge_memory.c
-index ced400f72d..a3bb8cf715 100644
+index 1e5d68acf6..04b55af4f9 100644
 --- a/mm/huge_memory.c
 +++ b/mm/huge_memory.c
 @@ -6,6 +6,7 @@
@@ -1536,7 +1526,7 @@ index ced400f72d..a3bb8cf715 100644
  #include <linux/sched.h>
  #include <linux/sched/mm.h>
  #include <linux/sched/numa_balancing.h>
-@@ -3614,14 +3615,48 @@ static void lru_add_split_folio(struct folio *folio, struct folio *new_folio,
+@@ -3658,14 +3659,48 @@ static void lru_add_split_folio(struct folio *folio, struct folio *new_folio,
  		/* page reclaim is reclaiming a huge page */
  		VM_WARN_ON(folio_test_lru(folio));
  		folio_get(new_folio);
@@ -13208,7 +13198,7 @@ index 0000000000..131018c2ea
 +
 +#endif /* _MM_LRU_MARIE_WALKER_COMPAT_H */
 diff --git a/mm/memcontrol-v1.c b/mm/memcontrol-v1.c
-index 835fc8e511..e1bc88597d 100644
+index 05ef55cae4..b375de0c5f 100644
 --- a/mm/memcontrol-v1.c
 +++ b/mm/memcontrol-v1.c
 @@ -11,6 +11,7 @@
@@ -13219,7 +13209,7 @@ index 835fc8e511..e1bc88597d 100644
  
  #include "internal.h"
  #include "swap.h"
-@@ -2319,6 +2320,16 @@ static int mem_cgroup_swappiness_write(struct cgroup_subsys_state *css,
+@@ -2329,6 +2330,16 @@ static int mem_cgroup_swappiness_write(struct cgroup_subsys_state *css,
  	} else
  		WRITE_ONCE(vm_swappiness, val);
  
@@ -13237,7 +13227,7 @@ index 835fc8e511..e1bc88597d 100644
  }
  
 diff --git a/mm/memcontrol.c b/mm/memcontrol.c
-index 1271d390b6..ac986cf90b 100644
+index 856a7d0758..f4cea905eb 100644
 --- a/mm/memcontrol.c
 +++ b/mm/memcontrol.c
 @@ -28,6 +28,7 @@
@@ -14177,7 +14167,7 @@ index e5dfc7bf49..5ba95c2c20 100644
  {
  	struct page *page = pfn_to_page(start_pfn);
 diff --git a/mm/rmap.c b/mm/rmap.c
-index d1819fd699..f94b1349fe 100644
+index f3b21aaa34..f78ca98488 100644
 --- a/mm/rmap.c
 +++ b/mm/rmap.c
 @@ -75,6 +75,7 @@
@@ -14188,7 +14178,7 @@ index d1819fd699..f94b1349fe 100644
  
  #include <asm/tlb.h>
  
-@@ -982,6 +983,11 @@ static bool folio_referenced_one(struct folio *folio,
+@@ -986,6 +987,11 @@ static bool folio_referenced_one(struct folio *folio,
  		if (lru_gen_enabled() && !lru_gen_switching() && pvmw.pte) {
  			if (lru_gen_look_around(&pvmw, nr))
  				referenced++;
